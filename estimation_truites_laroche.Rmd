@@ -1,0 +1,234 @@
+---
+title: "Estimation des densités de truites fario — Ruisseau de La Roche"
+author: "Margot Lechêne"
+date: '2026'
+output: html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+# Objectif et contexte
+Ce script estime les densités locales de truites fario (*Salmo trutta*) par secteur, année et classe d'âge sur le ruisseau de La Roche, en utilisant la même méthode que pour les saumons atlantiques (Carle & Strub pour le multipassage, correction par p moyen pour l'unipassage).
+
+Contrairement au script saumons, les données brutes sont ici individuelles (une ligne = un individu capturé) et doivent être agrégées en comptages par passage avant estimation. Les surfaces des secteurs et les coordonnées GPS sont récupérées depuis les résultats du script saumons.
+**Attention** : ce script dépend du script `estimation_saumons_laroche.Rmd`. Les objets `resultats_multi`, `resultats_uni` et la fonction `estimation_densite` doivent être en mémoire avant de lancer ce script.
+---
+**Données en entrée :**
+- `oir_margot_lechene_RR.csv` — données brutes individuelles toutes espèces (source : UMR 3E)
+- `resultats_multi` et `resultats_uni` — objets R issus du script saumons (surfaces et coordonnées)
+
+**Données en sortie :**
+- `resultats_multi_trf.csv` — abondances et probabilités de capture TRF multipassage
+- `resultats_uni_trf.csv` — abondances corrigées TRF unipassage
+- `tableau_final_trf.csv` — tableau fusionné, utilisé dans les analyses densité-dépendance
+
+---
+# Packages
+```{r packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(FSA)
+```
+---
+# Chemins et chargement des données
+
+```{r chemins}
+# A réadapter le chemin 
+chemin_data <- "W:/ESPACEML/02_code_data/Data_Scripts/"
+
+# Données brutes individuelles toutes espèces
+raw <- read.csv2(paste0(chemin_data, "oir_margot_lechene_RR.csv"),
+                 stringsAsFactors = FALSE)
+```
+
+```{r reprise_optionnelle, eval=FALSE}
+# SI REPRISE SANS RELANCER LE SCRIPT SAUMONS
+# Charger les objets nécessaires issus du script saumons
+resultats_multi <- read.csv2(paste0(chemin_data, "resultats_multipassage.csv"))
+resultats_uni   <- read.csv2(paste0(chemin_data, "resultats_unipassage.csv"))
+
+# La fonction estimation_densite doit également être redéfinie → relancer le chunk "fonction_estimation" du script saumons
+```
+---
+
+# Préparation des données TRF
+Le fichier brut contient une ligne par individu capturé, toutes espèces confondues. On extrait l'année et le mois depuis la date de capture, puis on filtre sur les truites fario capturées en automne (septembre–décembre) avec un âge déterminé.
+
+
+```{r preparation}
+# Extraction de l'année et du mois depuis la date de capture
+raw <- raw %>%
+  mutate(
+    annee = as.integer(substr(cam_date_heure_fin, 1, 4)),
+    mois  = as.integer(substr(cam_date_heure_fin, 6, 7))
+  )
+
+# Filtre : truites fario, âge connu, pêches automnales (sept-déc)
+trf <- raw %>%
+  filter(tax_code == "TRF",
+         !is.na(age_referent),
+         age_referent != "NA",
+         age_referent != ".",
+         age_referent != "") %>%
+  mutate(age_riv = age_referent) %>%
+  rename(sec_cod = sec_code)
+
+cat("Individus TRF retenus :", nrow(trf), "\n")
+cat("Années               :", range(trf$annee), "\n")
+cat("Secteurs             :", sort(unique(trf$sec_cod)), "\n")
+cat("Classes d'âge        :", unique(trf$age_riv), "\n")
+cat("Mois                 :", sort(unique(trf$mois)), "\n")
+```
+---
+
+# Agrégation en comptages par passage
+Le fichier brut contient un individu par ligne. On agrège en comptant le nombre d'individus capturés par combinaison secteur × année × mois × passage × classe d'âge, pour obtenir le format attendu par la fonction `estimation_densite`.
+
+```{r agregation}
+trf_agg %>%
+  group_by(sec_cod, annee, mois, num_passage, nb_passage,
+           tax_code, age_riv) %>%
+  summarise(nb = n(), .groups = "drop")
+
+cat("Lignes après agrégation :", nrow(trf_agg), "\n")
+```
+---
+
+# Récupération des surfaces et coordonnées
+Les surfaces des secteurs ne sont pas disponibles dans le fichier TRF brut. On les récupère depuis les tableaux de résultats saumons, les deux espèces ayant été pêchées sur les mêmes secteurs.
+```{r surfaces}
+# ── OBJETS NÉCESSAIRES ─────────────────────────────────
+# resultats_multi et resultats_uni issus du script saumons
+# Si absents : voir chunk "reprise_optionnelle" section 3
+# ───────────────────────────────────────────────────────
+
+# Surfaces depuis les résultats saumons (multi uniquement suffit)
+surfaces_completes <- resultats_multi %>%
+  distinct(sec_code, sec_surface, 
+           sec_coord_decimal_latitude,
+           sec_coord_decimal_longitude) %>%
+  mutate(sec_surface = as.numeric(sec_surface)) %>%
+  rename(sec_cod = sec_code)
+
+# Jointure sur trf_agg
+trf_agg <- trf_agg %>%
+  left_join(surfaces_completes, by = "sec_cod")
+
+# Suppression des secteurs invalides
+secteurs_invalides <- c("RR", "RR07_RR08", "RR08_RR09",
+                        "RR14P80_RR15P84", "RR15P84_RR15FIN",
+                        "RR19_RR20", "RR1_P80", "RR21", "RR22")
+
+trf_agg <- trf_agg %>%
+  filter(!sec_cod %in% secteurs_invalides)
+
+cat("NAs surface restants :", sum(is.na(trf_agg$sec_surface)), "\n")
+cat("Lignes restantes     :", nrow(trf_agg), "\n")
+cat("Colonnes             :", names(trf_agg), "\n")
+```
+
+```{r separation}
+trf_multi <- trf_agg %>% filter(nb_passage > 1)
+trf_uni   <- trf_agg %>% filter(nb_passage == 1)
+
+cat("Multipassage TRF :", nrow(trf_multi), "lignes\n")
+cat("Unipassage TRF   :", nrow(trf_uni),   "lignes\n")
+
+# Renommage pour correspondre au format attendu par estimation_densite
+trf_multi <- trf_multi %>% rename(mtd_num_passage = num_passage)
+trf_uni   <- trf_uni   %>% rename(mtd_num_passage = num_passage)
+```
+
+```{r multipassage}
+
+# La fonction estimation_densite attend sec_code — on renomme temporairement
+trf_multi_tmp <- trf_multi %>% rename(sec_code = sec_cod)
+
+resultats_multi_trf <- estimation_densite(trf_multi_tmp)
+
+# Conversion en numérique et calcul des densités
+resultats_multi_trf <- resultats_multi_trf %>%
+  mutate(across(c(Abondance, Abondance_L_CI, Abondance_U_CI,
+                  p, proba_Capture_L_CI, Proba_Capture_U_CI,
+                  sec_surface), as.numeric)) %>%
+  mutate(
+    Densite_ind_m2 = Abondance      / sec_surface,
+    Densite_L_CI   = Abondance_L_CI / sec_surface,
+    Densite_U_CI   = Abondance_U_CI / sec_surface
+  )
+
+cat("Résultats multipassage TRF :", nrow(resultats_multi_trf), "estimations\n")
+```
+```{r validation_p}
+p_values_trf <- resultats_multi_trf %>% filter(!is.na(p))
+
+cv_p_trf <- sd(p_values_trf$p) / mean(p_values_trf$p) * 100
+cat("Coefficient de variation de p :", round(cv_p_trf, 1), "%\n")
+
+kruskal_annee_trf <- kruskal.test(p ~ as.factor(annee), data = p_values_trf)
+cat("Kruskal-Wallis années   : H =", round(kruskal_annee_trf$statistic, 1),
+    ", p =", round(kruskal_annee_trf$p.value, 3), "\n")
+
+kruskal_secteur_trf <- kruskal.test(p ~ as.factor(sec_code), data = p_values_trf)
+cat("Kruskal-Wallis secteurs : H =", round(kruskal_secteur_trf$statistic, 1),
+    ", p =", round(kruskal_secteur_trf$p.value, 3), "\n")
+```
+
+```{r unipassage}
+# p moyen par année x classe d'âge
+p_moyen_trf <- resultats_multi_trf %>%
+  filter(!is.na(p)) %>%
+  group_by(annee, age_riv) %>%
+  summarise(p_moyen = mean(p), .groups = "drop")
+
+# p moyen global par classe d'âge (valeur de repli)
+p_global_trf <- resultats_multi_trf %>%
+  filter(!is.na(p)) %>%
+  group_by(age_riv) %>%
+  summarise(p_global = mean(p), .groups = "drop")
+
+# Correction des unipassages
+resultats_uni_trf <- trf_uni %>%
+  left_join(p_moyen_trf,  by = c("annee", "age_riv")) %>%
+  left_join(p_global_trf, by = "age_riv") %>%
+  mutate(p_moyen = coalesce(p_moyen, p_global)) %>%
+  select(-p_global) %>%
+  mutate(
+    nb             = as.numeric(nb),
+    sec_surface    = as.numeric(sec_surface),
+    Abondance      = nb / p_moyen,
+    Densite_ind_m2 = Abondance / sec_surface
+  )
+
+cat("Unipassages sans p   :", sum(is.na(resultats_uni_trf$p_moyen)), "\n")
+cat("Résultats unipassage :", nrow(resultats_uni_trf), "estimations\n")
+```
+
+```{r fusion_export}
+multi_bind_trf <- resultats_multi_trf %>%
+  mutate(methode = "multipassage") %>%
+  select(sec_code, annee, mois, age_riv, sec_surface,
+         sec_coord_decimal_latitude, sec_coord_decimal_longitude,
+         Abondance, Densite_ind_m2, methode)
+
+uni_bind_trf <- resultats_uni_trf %>%
+  mutate(methode = "unipassage") %>%
+  select(sec_cod, annee, mois, age_riv, sec_surface,
+         sec_coord_decimal_latitude, sec_coord_decimal_longitude,
+         Abondance, Densite_ind_m2, methode)
+
+tableau_final_trf <- bind_rows(multi_bind_trf, uni_bind_trf)
+
+cat("Tableau final TRF :", nrow(tableau_final_trf), "lignes\n")
+cat("Années            :", range(tableau_final_trf$annee), "\n")
+cat("Secteurs          :", n_distinct(tableau_final_trf$sec_cod), "\n")
+
+write.csv2(resultats_multi_trf, paste0(chemin_data, "resultats_multi_trf.csv"),
+           row.names = FALSE)
+write.csv2(resultats_uni_trf,   paste0(chemin_data, "resultats_uni_trf.csv"),
+           row.names = FALSE)
+write.csv2(tableau_final_trf,   paste0(chemin_data, "tableau_final_trf.csv"),
+           row.names = FALSE)
+
+cat("Fichiers exportés dans :", chemin_data, "\n")
+```

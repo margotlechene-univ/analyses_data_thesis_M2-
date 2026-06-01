@@ -1,0 +1,2032 @@
+---
+title: "Arbre des trajectoires de vie — Saumons atlantiques (Salmo salar) — Rivière Oir"
+author: "Margot Lechêne"
+date: "2026-03-18"
+output: html_document
+---
+
+ Construire un arbre des possibilités de vie pour les saumons
+ atlantiques PIT tagués sur la rivière Oir (2015-2025), en
+ intégrant trois sources de données :
+   1. Pêches électriques + échographies à La Roche (df_TRI)
+   2. Pêches électriques + pièges dans l'Oir et en Sélune (Oir)
+   3. Détections par antennes passives RFID (antennes)
+
+ Deux versions de l'arbre sont produites :
+   - Version classique : noeuds Aut/Pri avec états lieu x maturité
+   - Version améliorée : distingue captures physiques (noeuds)
+     et détections antennes (transitions entre noeuds), séparée
+     par classe d'âge (0+ et 1+)
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  dpi        = 300,
+  fig.align  = "center"
+)
+```
+
+
+# I. CHARGEMENT DES PACKAGES
+
+```{r packages}
+# --- Manipulation de données ---
+library(tidyverse)    # dplyr, ggplot2, tidyr, purrr, stringr, lubridate...
+library(lubridate)    # gestion des dates
+library(dplyr)        # manipulation de tableaux
+library(tidyr)        # pivot_wider, pivot_longer
+library(purrr)        # map, map2_dfr
+library(openxlsx)     # export Excel
+
+# --- Visualisation générale ---
+library(ggplot2)      # graphiques
+library(scales)       # formatage des axes
+library(patchwork)    # assembler plusieurs graphiques
+
+# --- Arbre de vie et graphes ---
+library(ggraph)       # visualisation de graphes avec ggplot2
+library(igraph)       # construction des objets graphe
+library(collapsibleTree) # arbre interactif
+
+# --- Diagramme de Sankey ---
+library(ggalluvial)   # diagramme alluvial / Sankey
+library(networkD3)    # Sankey interactif
+
+# --- Autres visualisations ---
+library(circlize)     # chord diagram
+library(treemapify)   # treemap
+
+# --- Diagramme de Venn ---
+library(VennDiagram)  # diagramme de Venn
+```
+
+
+# II. IMPORTATION DES DONNÉES
+
+```{r import}
+# --- Table 1 : pêches électriques + échographies à La Roche ---
+# Source : df_TRI_final.rds — données prétraitées (maturité, âge, condition)
+# 1 ligne = 1 capture individuelle à La Roche, automne uniquement
+df_TRI <- readRDS("W:/ESPACEML/02_code_data/03_df_cree_biotique/df_TRI_final.rds")
+
+# --- Table 2 : détections PIT tags hors La Roche ---
+# Source : Oir_TOUT20152025_SANSAUT.xlsx
+# Contient : pêches électriques Oir, pièges moulin descente/montée,
+#            pêches électriques Sélune (PTE01), pêches printanières Roche (RR*)
+library(readxl)
+Oir <- read_excel("W:/ESPACEML/02_code_data/01_df_filtree_brut/Oir_TOUT20152025_SANSAUT.xlsx")
+
+# --- Table 3 : détections par antennes passives RFID ---
+# Source : pits_commun_fichier_base_Margot_lechene.xlsx
+# Contient : toutes les détections RFID (La Roche, Oir, Sélune)
+antennes <- read_excel("C:/Users/mlechene/Desktop/pits_commun_fichier_base_Margot_lechene.xlsx",
+                       sheet = "pits_commun_fichier_base_Margot")
+```
+
+
+#III. NETTOYAGE ET HARMONISATION DES TABLES
+##III.1 Table Roche (df_TRI → Roche)
+
+```{r nettoyage_roche}
+# On repart de df_TRI et on :
+#   - Supprime les individus sans PIT tag
+#   - Nettoie les PIT tags (suppression du préfixe TAG_, espaces parasites)
+#   - Crée les colonnes date et heure depuis cam_date_heure_fin
+#   - Sélectionne et renomme les colonnes utiles
+#   - Force le lieu = "Roche" et source_detection = "peche_electrique_echo"
+
+Roche <- df_TRI %>%
+  # Garder seulement les individus avec PIT tag valide
+  dplyr::filter(!is.na(pits) & pits != "NA") %>%
+  dplyr::mutate(
+    # Nettoyage PIT tag : suppression du préfixe TAG_ et des espaces
+    pits  = trimws(gsub("^TAG_", "", as.character(pits))),
+    # Séparation date et heure depuis le datetime complet
+    date  = as.Date(cam_date_heure_fin),
+    heure = format(cam_date_heure_fin, "%H:%M:%S")
+  ) %>%
+  # Sélection et renommage des colonnes nécessaires
+  dplyr::select(
+    pits, date, heure,
+    maturite  = mature_final,       # maturité déterminée par écho + observation
+    age       = age_groupe_final,   # âge (0 ou 1+) imputé si manquant
+    phenotype = phenotype,          # code phénotype observé
+    LF        = cap_lf,             # longueur à la fourche (mm)
+    condition = residus_condition   # résidus de condition corporelle (log-log)
+  ) %>%
+  dplyr::mutate(
+    lieu             = "Roche",
+    source_detection = "peche_electrique_echo"
+  )
+
+# Vérification : aucun PIT tag ou âge ne doit être NA après nettoyage
+cat("Pits NA après harmonisation Roche :", sum(is.na(Roche$pits)), "\n")
+cat("Age NA après harmonisation Roche  :", sum(is.na(Roche$age)), "\n")
+
+# À placer juste après le chunk nettoyage_roche
+pits_roche <- unique(Roche$pits)
+cat("Nombre d'individus PIT tagués à La Roche :", length(pits_roche), "\n")
+```
+
+##III.2 Table Oir
+
+```{r nettoyage_oir}
+# Nettoyage Oir :
+#   - Création pits, date, heure depuis les colonnes brutes
+#   - Standardisation du lieu de capture (lieu_capture) depuis sec_code
+#   - Simplification en 3 lieux géographiques (lieu) + source_detection
+
+Oir <- Oir %>%
+  dplyr::mutate(
+    # Nettoyage PIT tag
+    pits  = trimws(as.character(substring)),
+    # Séparation date et heure
+    date  = as.Date(cam_date_heure_fin),
+    heure = format(cam_date_heure_fin, "%H:%M:%S"),
+
+    # --- Standardisation du lieu de capture depuis sec_code ---
+    lieu_capture = case_when(
+      sec_code == "CERISEL_PGD"                                  ~ "moulin_descente",
+      sec_code == "CERISEL_PGM"                                  ~ "moulin_montee",
+      sec_code %in% c("IAS04","IAS05","IAS08","IAS08martin",
+                      "IAS12","IAT01","OIR","OIR5","OIR6","PTE04") ~ "oir",
+      sec_code == "PTE01"                                        ~ "aval",
+      sec_code %in% c("RR","RR01","RR02","RR03","RR04","RR05",
+                      "RR06","RR07","RR08","RR09","RR10","RR11",
+                      "RR12","RR13","RR14","RR15","RR16","RR17",
+                      "RR18","RR19","RR20")                      ~ "Roche",
+      TRUE ~ paste0("autre_", sec_code)
+    ),
+
+    # --- Simplification en 3 zones géographiques ---
+    lieu = case_when(
+      lieu_capture %in% c("moulin_descente","moulin_montee","oir") ~ "Oir",
+      lieu_capture == "aval"                                        ~ "Selune",
+      lieu_capture == "Roche"                                       ~ "Roche",
+      TRUE ~ paste0("autre_", sec_code)
+    ),
+
+    # --- Type de détection ---
+    source_detection = case_when(
+      lieu_capture == "Roche"          ~ "peche_electrique",
+      lieu_capture == "oir"            ~ "peche_electrique",
+      lieu_capture == "moulin_descente"~ "piege_descente",
+      lieu_capture == "moulin_montee"  ~ "piege_montee",
+      lieu_capture == "aval"           ~ "peche_electrique",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  # Sélection des colonnes utiles
+  dplyr::select(pits, date, heure, lieu_capture, lieu, source_detection,
+                maturite_obs, maturite_echo, age_referent,
+                phenotype, LF = cap_lf)
+```
+
+##III.3 Table Antennes
+
+```{r nettoyage_antennes}
+# Nettoyage antennes :
+#   - Nettoyage PIT tag
+#   - Reconstruction date depuis date_detection_antenne
+#   - Reconstruction heure depuis heure_detection_antenne (date 1899 à ignorer)
+#   - Standardisation du lieu depuis nom_antenne
+#   - Agrégation : 1 détection par individu x jour x lieu (évite surreprésentation)
+
+antennes <- antennes %>%
+  dplyr::mutate(
+ # Nettoyage PIT tag : suppression du préfixe TAG_ ET des espaces
+    pits  = trimws(gsub("TAG_", "", as.character(pit))),
+    # Date correcte depuis date_detection_antenne
+    date  = as.Date(date_detection_antenne),
+    # Heure depuis heure_detection_antenne (la date 1899-12-31 est à ignorer)
+    heure = format(heure_detection_antenne, "%H:%M:%S"),
+
+    # --- Standardisation du lieu depuis le nom de l'antenne ---
+    lieu = case_when(
+      nom_antenne %in% c("AntenneA1Oregon Roche",
+                         "AntenneA2Oregon Roche")                   ~ "Roche",
+      nom_antenne %in% c("AngProf-A Oir piege","AngProf-B Oir piege",
+                         "AngProf-C Oir piege","AngProf-D Oir piege",
+                         "AngProf-E Oir piege","AngProf-F Oir piege",
+                         "AngProf-G Oir piege")                     ~ "Oir",
+      nom_antenne %in% c("Antenne aval Pont Cerisel-Amont",
+                         "Antenne aval Pont Cerisel-AVAL Oir piege",
+                         "Antenne aval Pont Cerisel-A-New sector Ang",
+                         "Antenne aval Pont Cerisel-B-New sector Ang",
+                         "Antenne aval Pont Cerisel-C-New sector Ang") ~ "Selune",
+      TRUE ~ NA_character_
+    ),
+    source_detection = "antenne_fixe",
+    # Variables biologiques inconnues par antenne
+    maturite  = NA,
+    LF        = NA,
+    phenotype = NA,
+    age       = NA
+  )
+
+# --- Agrégation : 1 détection par individu x jour x lieu ---
+# Une antenne peut détecter un individu stationnaire des milliers de fois/jour
+# On garde seulement la première détection de chaque combinaison pits x jour x lieu
+
+
+antennes <- antennes %>%
+  dplyr::filter(pits %in% pits_roche) %>%
+  dplyr::mutate(jour = as.Date(date)) %>%
+  dplyr::distinct(pits, jour, lieu, .keep_all = TRUE) %>%
+  dplyr::select(pits, date, heure, jour, lieu, source_detection,
+                maturite, LF, phenotype, age)
+
+cat("Nombre de détections antennes après agrégation :", nrow(antennes), "\n")
+```
+
+##III.4 Vérification des intersections entre tables (Venn)
+
+```{r venn}
+# Compter les PIT tags communs entre les 3 tables
+pits_oir <- unique(Oir$pits)
+pits_ant <- unique(antennes$pits)
+
+cat("Roche & Oir :", length(intersect(pits_roche, pits_oir)), "\n")
+cat("Roche & Antennes :", length(intersect(pits_roche, pits_ant)), "\n")
+cat("Oir & Antennes :", length(intersect(pits_oir, pits_ant)), "\n")
+cat("Communs aux 3 :", length(Reduce(intersect, list(pits_roche, pits_oir, pits_ant))), "\n")
+
+# Diagramme de Venn
+pits_list <- list(
+  "La Roche" = pits_roche,
+  "Oir"      = pits_oir,
+  "Antennes" = pits_ant
+)
+
+venn.plot <- venn.diagram(
+  x        = pits_list,
+  filename = NULL,   # NULL = ne pas sauvegarder directement
+  fill     = c("orange", "steelblue", "green3"),
+  alpha    = 0.5,
+  cex      = 1.5,
+  cat.cex  = 1.2
+)
+
+# Afficher
+grid::grid.draw(venn.plot)
+
+# Sauvegarder en PNG
+png("venn_pits.png", width = 800, height = 800, res = 150)
+grid::grid.draw(venn.plot)
+dev.off()
+```
+
+
+#IV. FUSION DES TROIS TABLES (table events)
+
+```{r fusion}
+# Harmonisation des types avant fusion
+Roche    <- Roche    %>% dplyr::mutate(LF = as.numeric(LF))
+Oir      <- Oir      %>% dplyr::mutate(LF = as.numeric(LF))
+antennes <- antennes %>% dplyr::mutate(LF = as.numeric(LF))
+
+# --- Fusion par bind_rows ---
+# On garde :
+#   - Toutes les observations de Roche (table de référence)
+#   - Les observations Oir et Antennes uniquement pour les individus de Roche
+# Résultat : 1 ligne par observation, toutes sources confondues
+events <- dplyr::bind_rows(
+  Roche,
+  Oir      %>% dplyr::filter(pits %in% pits_roche),
+  antennes %>% dplyr::filter(pits %in% pits_roche)
+) %>%
+  dplyr::arrange(pits, date)
+
+cat("Nombre total d'observations dans events :", nrow(events), "\n")
+events %>% dplyr::count(lieu)
+```
+
+
+#V. ATTRIBUTION DE LA MATURITÉ (variable MATURE)
+
+```{r maturite}
+# Règle hiérarchique pour déterminer la maturité de chaque observation :
+#   Règle 1 : si maturite (échographie Roche) est connue → on l'utilise
+#   Règle 2 : si maturite NA mais maturite_obs = "Spermiant" → MATURE = TRUE
+#   Règle 3 : si maturite NA, utiliser le phénotype :
+#             Phénotypes matures : ADAB, AFCN, AMON, AMPN, AMSN, JSSN
+#             Phénotypes immatures : JDIN, JDIP, JDIS, JDIT, JSIN, NNNN
+#   Règle 4 : si tout est NA → MATURE = NA
+# Note : certains JSIN sont matures car échographiés (règle 1 prévaut)
+
+events <- events %>%
+  dplyr::mutate(
+    MATURE = case_when(
+      maturite == TRUE                                       ~ TRUE,
+      maturite == FALSE                                      ~ FALSE,
+      is.na(maturite) & maturite_obs == "Spermiant"         ~ TRUE,
+      is.na(maturite) & phenotype %in% c("ADAB","AFCN",
+                                          "AMON","AMPN",
+                                          "AMSN","JSSN")   ~ TRUE,
+      is.na(maturite) & phenotype %in% c("JDIN","JDIP",
+                                          "JDIS","JDIT",
+                                          "JSIN","NNNN")   ~ FALSE,
+      is.na(maturite) & is.na(phenotype)                    ~ NA,
+      TRUE ~ NA
+    )
+  )
+
+# Vérification de la distribution maturite x MATURE x phenotype
+events %>% dplyr::count(maturite, MATURE, phenotype)
+```
+
+
+#VI. FENÊTRES TEMPORELLES ET NOEUDS BIOLOGIQUES
+
+```{r noeuds_temporels}
+# --- Définition des saisons ---
+# Automne  = septembre, octobre, novembre  → noeuds de suivi (pêches élec.)
+# Printemps = mars, avril, mai, juin       → noeuds de dévalaison
+# Autres mois : hors fenêtre principale
+
+events <- events %>%
+  dplyr::mutate(
+    mois   = lubridate::month(date),
+    saison = case_when(
+      mois %in% c(9,10,11)  ~ "Automne",
+      mois %in% c(3,4,5,6)  ~ "Printemps",
+      TRUE                   ~ paste0("autre_", mois)
+    ),
+    fenetre = saison %in% c("Automne", "Printemps")
+  )
+
+# --- Calcul du T0 : année de première capture par pêche électrique à La Roche ---
+# T0 est utilisé comme référence pour calculer l'année relative de chaque détection
+t0 <- events %>%
+  dplyr::filter(
+    lieu == "Roche",
+    source_detection %in% c("peche_electrique", "peche_electrique_echo")
+  ) %>%
+  dplyr::group_by(pits) %>%
+  dplyr::summarise(annee_t0 = min(lubridate::year(date), na.rm = TRUE))
+
+# --- Attribution des noeuds temporels ---
+# noeud = "Aut0", "Pri1", "Aut1"... selon la saison et l'année relative
+# annee_relative = 0 → même année que la première capture à La Roche
+events <- events %>%
+  dplyr::left_join(t0, by = "pits") %>%
+  dplyr::mutate(
+    annee_relative = lubridate::year(date) - annee_t0,
+    noeud = case_when(
+      saison == "Automne"   ~ paste0("Aut", annee_relative),
+      saison == "Printemps" ~ paste0("Pri", annee_relative),
+      TRUE                  ~ NA_character_
+    )
+  )
+
+# Vérification de la distribution des noeuds
+events %>% dplyr::count(noeud) %>% dplyr::arrange(noeud)
+```
+
+##VI.1 Correction des dates aberrantes
+
+```{r dates_aberrantes}
+# Certaines antennes ont des dates erronées (ex: 3024, 2036)
+# Ces observations sont sans valeur temporelle → suppression
+events %>% dplyr::filter(!is.na(date), lubridate::year(date) > 2026) %>%
+  dplyr::count(date, sort = TRUE)
+
+events <- events %>%
+  dplyr::filter(!is.na(date), lubridate::year(date) <= 2026)
+
+cat("Nombre d'observations après suppression dates aberrantes :", nrow(events), "\n")
+```
+
+
+#VII. CRÉATION DES ÉTATS BIOLOGIQUES (version classique)
+
+```{r etats_classiques}
+# L'état biologique de chaque observation est la combinaison :
+#   - Du lieu (Roche / Oir / Sélune)
+#   - De la maturité (Imm / Mat / NA)
+#   - Du type de détection (piège descente/montée, antenne, pêche)
+#
+# Exception : à Aut0 uniquement, l'état inclut l'âge (0 ou 1+)
+# pour distinguer les cohortes dès le départ
+
+events <- events %>%
+  dplyr::mutate(
+    etat = case_when(
+
+      # --- Aut0 : état avec âge (pêche électrique Roche uniquement) ---
+      noeud == "Aut0" & lieu == "Roche" &
+        source_detection == "peche_electrique_echo" &
+        MATURE == FALSE ~ paste0("Roche_Imm_", age),
+      noeud == "Aut0" & lieu == "Roche" &
+        source_detection == "peche_electrique_echo" &
+        MATURE == TRUE  ~ paste0("Roche_Mat_", age),
+      noeud == "Aut0" & lieu == "Roche" &
+        source_detection == "peche_electrique_echo" &
+        is.na(MATURE)   ~ paste0("Roche_NA_", age),
+
+      # --- Roche (autres noeuds) ---
+      lieu == "Roche" & MATURE == FALSE ~ "Roche_Imm",
+      lieu == "Roche" & MATURE == TRUE  ~ "Roche_Mat",
+      lieu == "Roche" & is.na(MATURE)   ~ "Roche_NA",
+
+      # --- Oir : piège de descente ---
+      source_detection == "piege_descente" & MATURE == FALSE ~ "Oir_descente_Imm",
+      source_detection == "piege_descente" & MATURE == TRUE  ~ "Oir_descente_Mat",
+      source_detection == "piege_descente" & is.na(MATURE)   ~ "Oir_descente_NA",
+
+      # --- Oir : piège de montée ---
+      source_detection == "piege_montee" & MATURE == FALSE ~ "Oir_montee_Imm",
+      source_detection == "piege_montee" & MATURE == TRUE  ~ "Oir_montee_Mat",
+      source_detection == "piege_montee" & is.na(MATURE)   ~ "Oir_montee_NA",
+
+      # --- Oir : pêche électrique ---
+      lieu == "Oir" & source_detection == "peche_electrique" & MATURE == FALSE ~ "Oir_resident_Imm",
+      lieu == "Oir" & source_detection == "peche_electrique" & MATURE == TRUE  ~ "Oir_resident_Mat",
+      lieu == "Oir" & source_detection == "peche_electrique" & is.na(MATURE)   ~ "Oir_resident_NA",
+
+      # --- Oir : antenne fixe ---
+      lieu == "Oir" & source_detection == "antenne_fixe" ~ "Oir_resident_NA",
+
+      # --- Sélune : pêche électrique ---
+      lieu == "Selune" & source_detection == "peche_electrique" & MATURE == FALSE ~ "Selune_Imm",
+      lieu == "Selune" & source_detection == "peche_electrique" & MATURE == TRUE  ~ "Selune_Mat",
+      lieu == "Selune" & source_detection == "peche_electrique" & is.na(MATURE)   ~ "Selune_NA",
+
+      # --- Sélune : antenne fixe ---
+      lieu == "Selune" & source_detection == "antenne_fixe" ~ "Selune_NA",
+
+      TRUE ~ NA_character_
+    )
+  )
+
+events %>% dplyr::count(etat) %>% dplyr::arrange(etat)
+```
+
+
+#VIII. CONSTRUCTION DE LA TABLE EVENTS_LARGE (version classique)
+
+```{r events_large}
+# --- Étape 1 : individus valides pour Aut0 ---
+# Critères : première capture à La Roche, par pêche électrique,
+#            en automne (annee_relative = 0), maturité connue
+pits_aut0_valides <- events %>%
+  dplyr::filter(
+    noeud == "Aut0",
+    lieu  == "Roche",
+    annee_relative == 0,
+    source_detection == "peche_electrique_echo"
+  ) %>%
+  dplyr::pull(pits) %>%
+  unique()
+
+cat("Nombre d'individus valides pour Aut0 :", length(pits_aut0_valides), "\n")
+
+# --- Étape 2 : détection la plus récente par individu x noeud ---
+# Pour Aut0 : priorité à la pêche électrique sur les antennes
+# Pour les autres noeuds : date + heure la plus récente
+events_noeud <- events %>%
+  dplyr::filter(!is.na(noeud), pits %in% pits_aut0_valides) %>%
+  dplyr::group_by(pits, noeud) %>%
+  dplyr::arrange(
+    desc(noeud == "Aut0" & source_detection %in% c("peche_electrique","peche_electrique_echo")),
+    desc(date),
+    desc(heure)
+  ) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup()
+
+# --- Étape 3 : passage en format large ---
+# 1 ligne par individu, 1 colonne par noeud
+# Les individus non détectés à un noeud reçoivent "Non_vu"
+events_large <- events_noeud %>%
+  dplyr::select(pits, noeud, etat) %>%
+  tidyr::pivot_wider(names_from = noeud, values_from = etat) %>%
+  dplyr::select(pits, dplyr::any_of(c("Aut0","Pri1","Aut1","Pri2","Aut2",
+                                       "Pri3","Aut3","Aut4","Aut5","Aut6",
+                                       "Aut7","Aut8","Aut10"))) %>%
+  dplyr::mutate(dplyr::across(-pits, ~tidyr::replace_na(., "Non_vu"))) %>%
+  # Filtre : Aut0 doit être une capture connue (Roche_Imm ou Roche_Mat)
+  dplyr::filter(stringr::str_starts(Aut0, "Roche_Imm") |
+                stringr::str_starts(Aut0, "Roche_Mat"))
+
+cat("Nombre d'individus dans events_large :", nrow(events_large), "\n")
+events_large %>% dplyr::count(Aut0)
+```
+
+
+#IX. PALETTE DE COULEURS (version classique)
+
+```{r palette_classique}
+# Palette de couleurs pour les états biologiques classiques
+# Automne : tons orangés (immature clair, mature foncé, NA marron)
+# Printemps : tons bleutés (immature clair, mature foncé, NA pastel)
+# Non vu : gris
+
+couleurs_etats <- c(
+  "Roche_Imm_0"      = "#f4a460",  # orange clair (0+ immature)
+  "Roche_Imm_1"      = "#e8893a",  # orange moyen (1+ immature)
+  "Roche_Mat_0"      = "#d4622a",  # orange foncé (0+ mature)
+  "Roche_Mat_1"      = "#b84a1a",  # orange très foncé (1+ mature)
+  "Roche_Imm"        = "#f4a460",
+  "Roche_Mat"        = "#d4622a",
+  "Roche_NA"         = "#c4a882",  # marron clair
+  "Oir_descente_Imm" = "#90caf9",
+  "Oir_descente_Mat" = "#1a5276",
+  "Oir_descente_NA"  = "#aed6f1",
+  "Oir_montee_Imm"   = "#5dade2",
+  "Oir_montee_Mat"   = "#1a5276",
+  "Oir_montee_NA"    = "#aed6f1",
+  "Oir_resident_Imm" = "#5dade2",
+  "Oir_resident_Mat" = "#1a5276",
+  "Oir_resident_NA"  = "#aed6f1",
+  "Selune_Imm"       = "#a8d8ea",
+  "Selune_Mat"       = "#0d47a1",
+  "Selune_NA"        = "#bbdefb",
+  "Non_vu"           = "#b0b0b0"   # gris
+)
+```
+
+
+#X. VISUALISATIONS — VERSION CLASSIQUE
+##X.1 Arbre interactif (collapsibleTree)
+
+```{r arbre_interactif}
+library(collapsibleTree)
+
+arbre_data <- events_large %>%
+  dplyr::mutate(
+    Aut0 = paste0("Aut0: ", Aut0),
+    Pri1 = paste0("Pri1: ", Pri1),
+    Aut1 = paste0("Aut1: ", Aut1),
+    Pri2 = paste0("Pri2: ", Pri2),
+    Aut2 = paste0("Aut2: ", Aut2),
+    Pri3 = paste0("Pri3: ", Pri3),
+    Aut3 = paste0("Aut3: ", Aut3)
+  )
+
+collapsibleTree(
+  arbre_data,
+  hierarchy = c("Aut0","Pri1","Aut1","Pri2","Aut2","Pri3","Aut3"),
+  width     = 1200,
+  height    = 800,
+  zoomable  = TRUE,
+  nodeSize  = "leafCount"
+)
+```
+
+##X.2 Préparation des liens pour l'arbre ggraph
+
+```{r preparation_liens}
+noeuds_ordre <- c("Aut0","Pri1","Aut1","Pri2","Aut2","Pri3","Aut3")
+
+# Créer les liens entre noeuds consécutifs avec effectifs
+liens <- purrr::map2_dfr(
+  noeuds_ordre[-length(noeuds_ordre)],
+  noeuds_ordre[-1],
+  function(from, to) {
+    events_large %>%
+      dplyr::count(.data[[from]], .data[[to]]) %>%
+      dplyr::rename(etat_from = 1, etat_to = 2) %>%
+      dplyr::mutate(
+        source = paste0(from, "\n", etat_from),
+        target = paste0(to,   "\n", etat_to)
+      )
+  }
+)
+
+# Noeuds uniques avec couleurs par saison/maturité
+noeuds_uniques <- data.frame(
+  name = unique(c(liens$source, liens$target))
+) %>%
+  dplyr::mutate(
+    saison = case_when(
+      stringr::str_starts(name, "Aut") ~ "Automne",
+      stringr::str_starts(name, "Pri") ~ "Printemps"
+    ),
+    maturite_col = case_when(
+      stringr::str_detect(name, "Imm")    ~ "Immature",
+      stringr::str_detect(name, "Mat")    ~ "Mature",
+      stringr::str_detect(name, "Non_vu") ~ "Non vu",
+      stringr::str_detect(name, "NA")     ~ "Inconnu",
+      TRUE                                 ~ "Autre"
+    ),
+    couleur = case_when(
+      maturite_col == "Non vu"                              ~ "#b0b0b0",
+      saison == "Automne"  & maturite_col == "Mature"       ~ "#d4622a",
+      saison == "Automne"  & maturite_col == "Immature"     ~ "#f4a460",
+      saison == "Automne"  & maturite_col == "Inconnu"      ~ "#c4a882",
+      saison == "Printemps"& maturite_col == "Mature"       ~ "#1a5276",
+      saison == "Printemps"& maturite_col == "Immature"     ~ "#5dade2",
+      saison == "Printemps"& maturite_col == "Inconnu"      ~ "#aed6f1",
+      TRUE ~ "#ffffff"
+    )
+  )
+
+# Ajouter n_log pour le gradient de couleur des flèches
+liens <- liens %>%
+  dplyr::mutate(n_log = log10(n + 1))
+```
+
+##X.3 Arbre complet avec gradient de couleur sur les flèches
+
+```{r arbre_complet}
+# Construction du graphe igraph
+g_complet <- igraph::graph_from_data_frame(
+  d        = liens %>% dplyr::select(source, target, n, n_log),
+  vertices = noeuds_uniques,
+  directed = TRUE
+)
+
+# Layout avec alignement par noeud temporel
+layout_manuel <- ggraph::create_layout(g_complet, layout = "sugiyama")
+layout_manuel <- layout_manuel %>%
+  dplyr::mutate(
+    y = case_when(
+      stringr::str_starts(name, "Aut0") ~ 7,
+      stringr::str_starts(name, "Pri1") ~ 6,
+      stringr::str_starts(name, "Aut1") ~ 5,
+      stringr::str_starts(name, "Pri2") ~ 4,
+      stringr::str_starts(name, "Aut2") ~ 3,
+      stringr::str_starts(name, "Pri3") ~ 2,
+      stringr::str_starts(name, "Aut3") ~ 1
+    )
+  )
+
+set.seed(42)
+ggraph::ggraph(layout_manuel) +
+  ggraph::geom_edge_link(
+    aes(color = n_log, label = n),
+    width        = 0.8,
+    angle_calc   = "along",
+    label_size   = 2.5,
+    label_colour = "#0d1117",
+    label_dodge  = unit(3, "mm"),
+    arrow        = arrow(length = unit(2, "mm"), type = "closed"),
+    end_cap      = ggraph::circle(4, "mm")
+  ) +
+  ggraph::scale_edge_color_gradientn(
+    colors = c("#ffe066","#f4a460","#e76f51","#c0392b","#8b0000"),
+    trans  = "log10",
+    name   = "Effectif"
+  ) +
+  ggraph::geom_node_label(
+    aes(label = name, fill = couleur),
+    size          = 2.5,
+    color         = "#0d1117",
+    label.padding = unit(0.2, "lines"),
+    label.r       = unit(0.15, "lines"),
+    repel         = TRUE,
+    max.overlaps  = Inf
+  ) +
+  scale_fill_identity(
+    guide  = "legend", name = "",
+    labels = c("#d4622a"="Automne — Mature","#f4a460"="Automne — Immature",
+               "#c4a882"="Automne — Inconnu","#1a5276"="Printemps — Mature",
+               "#5dade2"="Printemps — Immature","#aed6f1"="Printemps — Inconnu",
+               "#b0b0b0"="Non vu"),
+    breaks = c("#d4622a","#f4a460","#c4a882","#1a5276","#5dade2","#aed6f1","#b0b0b0")
+  ) +
+  theme_void() +
+  theme(plot.background = element_rect(fill = "white", color = NA),
+        legend.position = "bottom",
+        plot.title      = element_text(hjust = 0.5, size = 14, face = "bold"),
+        plot.margin     = margin(40, 40, 40, 40)) +
+  labs(title = "Arbre des trajectoires de vie — Saumons OIR")
+
+ggsave("arbre_trajectoires_complet.png", width = 26, height = 18, dpi = 300)
+```
+
+##X.4 Sankey (ggalluvial — cases égales)
+
+```{r sankey}
+alluvial_equal <- events_large %>%
+  dplyr::select(pits, Aut0, Pri1, Aut1, Pri2, Aut2, Pri3, Aut3) %>%
+  tidyr::pivot_longer(cols = -pits, names_to = "noeud", values_to = "etat") %>%
+  dplyr::mutate(
+    noeud = factor(noeud, levels = c("Aut0","Pri1","Aut1","Pri2","Aut2","Pri3","Aut3")),
+    y = 1  # toutes les cases ont le même poids visuel
+  )
+
+ggplot(alluvial_equal,
+       aes(x = noeud, stratum = etat, alluvium = pits,
+           fill = etat, label = etat, y = y)) +
+  ggalluvial::geom_flow(alpha = 0.4, color = "white", linewidth = 0.2) +
+  ggalluvial::geom_stratum(width = 0.4, color = "white") +
+  geom_text(stat = "stratum", size = 2.5, fontface = "bold") +
+  scale_fill_manual(values = couleurs_etats) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 10, face = "bold"),
+        axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        panel.grid = element_blank(), legend.position = "bottom") +
+  labs(title = "Flux des trajectoires de vie — Saumons OIR",
+       x = "Noeud temporel", y = NULL, fill = "État")
+
+ggsave("sankey_equal.png", width = 26, height = 14, dpi = 300)
+```
+
+##X.5 Heatmap des probabilités de transition
+
+```{r heatmap_transitions}
+# Calcul des probabilités de transition entre états consécutifs
+# P(état_t+1 | état_t) = n(A→B) / n(A)
+transitions <- events_large %>%
+  dplyr::select(pits, Aut0, Pri1, Aut1, Pri2, Aut2, Pri3, Aut3) %>%
+  tidyr::pivot_longer(cols = -pits, names_to = "noeud", values_to = "etat") %>%
+  dplyr::mutate(noeud = factor(noeud, levels = c("Aut0","Pri1","Aut1","Pri2","Aut2","Pri3","Aut3"))) %>%
+  dplyr::group_by(pits) %>%
+  dplyr::mutate(etat_suivant = dplyr::lead(etat)) %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(!is.na(etat_suivant)) %>%
+  dplyr::count(etat, etat_suivant) %>%
+  dplyr::group_by(etat) %>%
+  dplyr::mutate(proba = n / sum(n))
+
+ggplot(transitions, aes(x = etat_suivant, y = etat, fill = proba)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(proba, 2)), size = 2.5) +
+  scale_fill_gradient(low = "#fffde7", high = "#b71c1c", name = "Probabilité") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+        axis.text.y = element_text(size = 7),
+        plot.title  = element_text(hjust = 0.5, face = "bold")) +
+  labs(title = "Matrice de transition entre états",
+       x = "État suivant", y = "État actuel")
+
+ggsave("heatmap_transitions.png", width = 18, height = 14, dpi = 300)
+```
+
+##X.6 Tableau des trajectoires (PDF multi-pages)
+
+```{r tableau_trajectoires}
+noeuds_list <- c("Aut0","Pri1","Aut1","Pri2","Aut2","Pri3","Aut3",
+                  "Aut4","Aut5","Aut6","Aut7","Aut8","Aut10")
+n_noeuds <- length(noeuds_list)
+
+# Calcul des trajectoires avec proportions
+traj_summary <- events_large %>%
+  dplyr::count(Aut0, Pri1, Aut1, Pri2, Aut2, Pri3, Aut3,
+               Aut4, Aut5, Aut6, Aut7, Aut8, Aut10) %>%
+  dplyr::mutate(prop = round(n / sum(n) * 100, 3), traj_id = dplyr::row_number()) %>%
+  dplyr::arrange(desc(n))
+
+traj_long <- traj_summary %>%
+  dplyr::mutate(traj_id = factor(traj_id, levels = rev(traj_id))) %>%
+  tidyr::pivot_longer(cols = all_of(noeuds_list), names_to = "noeud", values_to = "etat") %>%
+  dplyr::mutate(noeud = factor(noeud, levels = noeuds_list))
+
+traj_summary_plot <- traj_summary %>%
+  dplyr::mutate(traj_id = factor(traj_id, levels = rev(traj_id)))
+
+# Export PDF multi-pages (30 trajectoires par page)
+n_par_page <- 30
+n_pages    <- ceiling(nrow(traj_summary) / n_par_page)
+
+pdf("tableau_trajectoires.pdf", width = 22, height = 14)
+for (i in 1:n_pages) {
+  ids_page <- traj_summary$traj_id[((i-1)*n_par_page+1) : min(i*n_par_page, nrow(traj_summary))]
+  p <- ggplot(traj_long %>% filter(traj_id %in% ids_page),
+              aes(x = noeud, y = traj_id, fill = etat)) +
+    geom_tile(color = "black", linewidth = 0.5) +
+    geom_text(aes(label = etat), size = 3, color = "black", fontface = "bold") +
+    geom_text(data = traj_summary_plot %>% filter(traj_id %in% ids_page),
+              aes(x = n_noeuds + 1, y = traj_id,
+                  label = paste0("n=", n, "  (", prop, "%)")),
+              inherit.aes = FALSE, size = 4, hjust = 0, color = "#333333") +
+    scale_fill_manual(values = couleurs_etats) +
+    scale_x_discrete(expand = expansion(add = c(0.5, 2.5))) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(size = 9, face = "bold"),
+          axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+          panel.grid = element_blank(), legend.position = "bottom",
+          plot.margin = margin(20, 150, 20, 20)) +
+    labs(title = paste0("Trajectoires de vie — Saumons OIR | page ", i, "/", n_pages),
+         x = "Noeud temporel", y = NULL, fill = "État")
+  print(p)
+}
+dev.off()
+```
+
+##X.7 Autres visualisations
+
+```{r autres_visu}
+# --- Chord diagram ---
+png("chord_diagram.png", width = 1800, height = 1800, res = 150)
+circlize::chordDiagram(
+  transitions %>% dplyr::filter(etat != "Non_vu", etat_suivant != "Non_vu") %>%
+    dplyr::select(etat, etat_suivant, n) %>% as.data.frame(),
+  grid.col = couleurs_etats, transparency = 0.4, directional = 1,
+  direction.type = "arrows", annotationTrack = "grid",
+  preAllocateTracks = list(track.height = 0.1)
+)
+title("Transitions entre états — Saumons OIR")
+dev.off()
+
+# --- Treemap ---
+treemap_data <- events_large %>%
+  dplyr::count(Aut0, Pri1, Aut1) %>%
+  dplyr::mutate(trajectoire = paste(Aut0,"→",Pri1,"→",Aut1),
+                prop = round(n / sum(n) * 100, 1), groupe = Aut0) %>%
+  dplyr::filter(n > 5)
+
+ggplot(treemap_data,
+       aes(area = n, fill = groupe,
+           label = paste0(trajectoire, "\n", prop, "%\n(n=", n, ")"),
+           subgroup = groupe)) +
+  treemapify::geom_treemap() +
+  treemapify::geom_treemap_subgroup_border(color = "black", size = 3) +
+  treemapify::geom_treemap_text(color = "white", size = 9, fontface = "bold",
+                                place = "centre", reflow = TRUE) +
+  scale_fill_manual(values = couleurs_etats) +
+  theme_minimal() +
+  labs(title = "Treemap des trajectoires Aut0→Pri1→Aut1 — Saumons OIR", fill = "État Aut0")
+
+ggsave("treemap_trajectoires.png", width = 20, height = 14, dpi = 300)
+```
+
+
+#XI. VERSION AMÉLIORÉE : NOEUDS + TRANSITIONS ANTENNES
+
+Cette version distingue :
+- Noeuds : captures physiques uniquement (Roche, Oir, Aval)
+             → maturité connue
+   - Transitions : détections antennes uniquement
+              → entre deux noeuds consécutifs (hiver ou été)
+   - Deux tableaux séparés : 0+ et 1+
+
+##XI.1 Redéfinition des lieux (lieu_new)
+
+```{r lieu_new}
+events <- events %>%
+  dplyr::mutate(
+    lieu_new = case_when(
+      # Roche : toutes pêches électriques (automne + printemps)
+      lieu == "Roche" & source_detection %in% c("peche_electrique","peche_electrique_echo") ~ "Roche",
+      # Antennes à La Roche
+      lieu == "Roche" & source_detection == "antenne_fixe" ~ "Antennes_Roche",
+      # Oir : pêches électriques uniquement
+      lieu == "Oir" & source_detection == "peche_electrique" ~ "Oir",
+      # Antennes_Moulin : pièges + antennes Oir + antennes Sélune
+      source_detection %in% c("piege_descente","piege_montee") ~ "Antennes_Moulin",
+      lieu == "Oir" & source_detection == "antenne_fixe"        ~ "Antennes_Moulin",
+      lieu == "Selune" & source_detection == "antenne_fixe"     ~ "Antennes_Moulin",
+      # Aval : pêche électrique PTE01
+      lieu == "Selune" & source_detection == "peche_electrique" ~ "Aval",
+      TRUE ~ NA_character_
+    )
+  )
+
+events %>% dplyr::count(lieu_new)
+```
+
+##XI.2 Redéfinition des fenêtres temporelles (fenetre_type)
+
+```{r fenetre_type}
+# Noeuds : captures physiques en automne ou printemps
+# Transitions hiver (déc-fév) : entre Aut_n et Pri_(n+1)
+# Transitions été (juil-août) : entre Pri_n et Aut_n
+
+events <- events %>%
+  dplyr::mutate(
+    fenetre_type = case_when(
+      mois %in% c(9,10,11) & lieu_new %in% c("Roche","Oir","Aval") ~ "noeud_automne",
+      mois %in% c(3,4,5,6) & lieu_new %in% c("Roche","Oir","Aval") ~ "noeud_printemps",
+      mois %in% c(12,1,2)  & lieu_new %in% c("Antennes_Roche","Antennes_Moulin") ~ "transition_hiver",
+      mois %in% c(7,8)     & lieu_new %in% c("Antennes_Roche","Antennes_Moulin") ~ "transition_ete",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+##XI.3 Calcul des noeuds et transitions (noeud_new)
+
+```{r noeud_new}
+# Attention : pour la transition hiver
+#   décembre de l'année n → Trans_Aut_n_Pri_(n+1) : annee_relative = n, donc +1 pour Pri
+#   janvier/février de l'année n+1 → Trans_Aut_(n-1)_Pri_n : annee_relative = n-1 pour Aut
+
+events <- events %>%
+  dplyr::mutate(
+    noeud_new = case_when(
+      fenetre_type == "noeud_automne"   ~ paste0("Aut", annee_relative),
+      fenetre_type == "noeud_printemps" ~ paste0("Pri", annee_relative),
+      # Transition hiver décembre → Aut_n à Pri_(n+1)
+      fenetre_type == "transition_hiver" & mois == 12 ~
+        paste0("Trans_Aut", annee_relative, "_Pri", annee_relative + 1),
+      # Transition hiver jan/fév → Aut_(n-1) à Pri_n
+      fenetre_type == "transition_hiver" & mois %in% c(1,2) ~
+        paste0("Trans_Aut", annee_relative - 1, "_Pri", annee_relative),
+      # Transition été → Pri_n à Aut_n
+      fenetre_type == "transition_ete" ~
+        paste0("Trans_Pri", annee_relative, "_Aut", annee_relative),
+      TRUE ~ NA_character_
+    )
+  )
+
+events %>% dplyr::count(noeud_new) %>% dplyr::arrange(noeud_new)
+```
+
+##XI.4 États biologiques pour la version améliorée (etat_new)
+
+```{r etat_new}
+events <- events %>%
+  dplyr::mutate(
+    etat_new = case_when(
+      # --- Aut0 avec âge ---
+      noeud_new == "Aut0" & lieu_new == "Roche" &
+        source_detection %in% c("peche_electrique","peche_electrique_echo") &
+        MATURE == FALSE ~ paste0("Roche_Imm_", age),
+      noeud_new == "Aut0" & lieu_new == "Roche" &
+        source_detection %in% c("peche_electrique","peche_electrique_echo") &
+        MATURE == TRUE  ~ paste0("Roche_Mat_", age),
+      noeud_new == "Aut0" & lieu_new == "Roche" &
+        source_detection %in% c("peche_electrique","peche_electrique_echo") &
+        is.na(MATURE)   ~ paste0("Roche_NA_", age),
+      # --- Roche (autres noeuds) ---
+      lieu_new == "Roche" & MATURE == FALSE ~ "Roche_Imm",
+      lieu_new == "Roche" & MATURE == TRUE  ~ "Roche_Mat",
+      lieu_new == "Roche" & is.na(MATURE)   ~ "Roche_NA",
+      # --- Oir pêche électrique ---
+      lieu_new == "Oir" & MATURE == FALSE ~ "Oir_Imm",
+      lieu_new == "Oir" & MATURE == TRUE  ~ "Oir_Mat",
+      lieu_new == "Oir" & is.na(MATURE)   ~ "Oir_NA",
+      # --- Aval pêche électrique ---
+      lieu_new == "Aval" & MATURE == FALSE ~ "Aval_Imm",
+      lieu_new == "Aval" & MATURE == TRUE  ~ "Aval_Mat",
+      lieu_new == "Aval" & is.na(MATURE)   ~ "Aval_NA",
+      # --- Antennes (transitions) ---
+      lieu_new == "Antennes_Roche"  ~ "Antennes_Roche",
+      lieu_new == "Antennes_Moulin" ~ "Antennes_Moulin",
+      TRUE ~ NA_character_
+    )
+  )
+
+events %>% dplyr::count(etat_new) %>% dplyr::arrange(etat_new)
+```
+
+##XI.5 Détection la plus récente par individu x noeud_new
+
+```{r events_noeud_new}
+# Pour chaque individu x noeud_new :
+#   - Priorité à la pêche électrique pour Aut0
+#   - Sinon : date + heure la plus récente
+events_noeud_new <- events %>%
+  dplyr::filter(!is.na(noeud_new)) %>%
+  dplyr::group_by(pits, noeud_new) %>%
+  dplyr::arrange(
+    desc(noeud_new == "Aut0" & source_detection %in% c("peche_electrique","peche_electrique_echo")),
+    desc(date), desc(heure)
+  ) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup()
+```
+
+##XI.6 Listes de noeuds dans l'ordre chronologique
+
+```{r noeuds_listes}
+# Fonction utilitaire : forcer toutes les colonnes même si absentes des données
+forcer_colonnes <- function(df, noeuds) {
+  colonnes_manquantes <- setdiff(noeuds, names(df))
+  for (col in colonnes_manquantes) { df[[col]] <- "Non_vu" }
+  df %>% dplyr::select(pits, dplyr::all_of(noeuds))
+}
+
+# --- 0+ : commence à Aut0 ---
+noeuds_0plus <- c(
+  "Aut0",
+  "Trans_Aut0_Pri1",
+  "Pri1",  "Trans_Pri1_Aut1",
+  "Aut1",  "Trans_Aut1_Pri2",
+  "Pri2",  "Trans_Pri2_Aut2",
+  "Aut2",  "Trans_Aut2_Pri3",
+  "Pri3",  "Trans_Pri3_Aut3",
+  "Aut3",  "Trans_Aut3_Pri4",
+  "Pri4",  "Trans_Pri4_Aut4",
+  "Aut4",  "Trans_Aut4_Pri5"
+)
+
+# --- 1+ : commence à Aut1 (décalage d'un an par rapport aux 0+) ---
+noeuds_1plus <- c(
+  "Aut1",
+  "Trans_Aut1_Pri2",
+  "Pri2",  "Trans_Pri2_Aut2",
+  "Aut2",  "Trans_Aut2_Pri3",
+  "Pri3",  "Trans_Pri3_Aut3",
+  "Aut3",  "Trans_Aut3_Pri4",
+  "Pri4",  "Trans_Pri4_Aut4",
+  "Aut4",  "Trans_Aut4_Pri5",
+  "Pri5",  "Trans_Pri5_Aut5",
+  "Aut5",  "Trans_Aut5_Pri6",
+  "Pri6",  "Trans_Pri6_Aut6",
+  "Aut6",  "Trans_Aut6_Pri7"
+)
+```
+
+##XI.7 Construction des deux tables larges (0+ et 1+)
+
+```{r tables_larges_ameliorees}
+# --- Table 0+ ---
+pits_0plus <- events_large %>%
+  dplyr::filter(stringr::str_starts(Aut0, "Roche_Imm_0") |
+                stringr::str_starts(Aut0, "Roche_Mat_0")) %>%
+  dplyr::pull(pits)
+
+events_large_0plus <- events_noeud_new %>%
+  dplyr::filter(pits %in% pits_0plus) %>%
+  dplyr::select(pits, noeud_new, etat_new) %>%
+  tidyr::pivot_wider(names_from = noeud_new, values_from = etat_new) %>%
+  dplyr::mutate(dplyr::across(-pits, ~tidyr::replace_na(., "Non_vu")))
+
+# Forcer TOUTES les colonnes (même celles sans données = Non_vu)
+events_large_0plus <- forcer_colonnes(events_large_0plus, noeuds_0plus)
+
+# --- Table 1+ ---
+pits_1plus <- events_large %>%
+  filter(str_starts(Aut0, "Roche_Imm_1") | str_starts(Aut0, "Roche_Mat_1")) %>%
+  pull(pits)
+
+# Récupérer l'état Aut0 depuis events_large et le renommer Aut1
+aut1_depuis_aut0 <- events_large %>%
+  filter(pits %in% pits_1plus) %>%
+  select(pits, Aut1 = Aut0)  # Aut0 des 1+ devient leur Aut1 biologique
+
+# Récupérer toutes les autres détections depuis events_noeud_new
+# (noeuds Pri2, Aut2, Pri3, Aut3... + transitions)
+# On exclut Aut1 car on vient de le définir proprement
+autres_noeuds_1plus <- events_noeud_new %>%
+  filter(pits %in% pits_1plus, noeud_new != "Aut1") %>%
+  select(pits, noeud_new, etat_new) %>%
+  pivot_wider(names_from = noeud_new, values_from = etat_new)
+
+# Fusionner les deux
+events_large_1plus <- aut1_depuis_aut0 %>%
+  left_join(autres_noeuds_1plus, by = "pits") %>%
+  mutate(across(-pits, ~replace_na(., "Non_vu")))
+
+events_large_1plus <- forcer_colonnes(events_large_1plus, noeuds_1plus)
+
+# Vérification
+events_large_1plus %>% dplyr::count(Aut1)
+nrow(events_large_1plus)
+# Vérifications
+cat("Individus 0+ :", nrow(events_large_0plus), "\n")
+cat("Individus 1+ :", nrow(events_large_1plus), "\n")
+events_large_0plus %>% dplyr::count(Aut0)
+events_large_1plus %>% dplyr::count(Aut1)
+```
+
+##XI.8 Palette de couleurs (version améliorée)
+
+```{r palette_amelioree}
+couleurs_etats_new <- c(
+  "Roche_Imm_0"     = "#f4a460",  # orange clair 0+ immature
+  "Roche_Imm_1"     = "#e8893a",  # orange moyen 1+ immature
+  "Roche_Mat_0"     = "#d4622a",  # orange foncé 0+ mature
+  "Roche_Mat_1"     = "#b84a1a",  # orange très foncé 1+ mature
+  "Roche_Imm"       = "#f4a460",
+  "Roche_Mat"       = "#d4622a",
+  "Roche_NA"        = "#c4a882",
+  "Oir_Imm"         = "#5dade2",
+  "Oir_Mat"         = "#1a5276",
+  "Oir_NA"          = "#aed6f1",
+  "Aval_Imm"        = "#a569bd",
+  "Aval_Mat"        = "#6c3483",
+  "Aval_NA"         = "#d2b4de",
+  "Antennes_Roche"  = "#27ae60",  # vert — détections antennes La Roche
+  "Antennes_Moulin" = "#1a6b3c",  # vert foncé — détections antennes Moulin/Sélune
+  "Non_vu"          = "#b0b0b0"   # gris
+)
+```
+
+##XI.9 Tableaux des trajectoires 0+ et 1+ (PDF multi-pages)
+
+```{r tableaux_ameliores}
+# Fonction générique pour produire un tableau de trajectoires
+produire_tableau_trajectoires <- function(events_large_x, noeuds_x, titre, fichier_pdf) {
+
+  noeuds_present <- names(events_large_x)[-1]  # toutes colonnes sauf pits
+  n_noeuds_x     <- length(noeuds_present)
+
+  # Calcul des trajectoires avec proportions
+  traj_summary_x <- events_large_x %>%
+    dplyr::count(dplyr::across(dplyr::all_of(noeuds_present))) %>%
+    dplyr::mutate(prop = round(n / sum(n) * 100, 3), traj_id = dplyr::row_number()) %>%
+    dplyr::arrange(desc(n))
+
+  traj_long_x <- traj_summary_x %>%
+    dplyr::mutate(traj_id = factor(traj_id, levels = rev(traj_id))) %>%
+    tidyr::pivot_longer(cols = dplyr::all_of(noeuds_present),
+                        names_to = "noeud", values_to = "etat") %>%
+    dplyr::mutate(noeud = factor(noeud, levels = noeuds_present))
+
+  traj_summary_plot_x <- traj_summary_x %>%
+    dplyr::mutate(traj_id = factor(traj_id, levels = rev(traj_id)))
+
+  n_par_page <- 30
+  n_pages_x  <- ceiling(nrow(traj_summary_x) / n_par_page)
+
+  pdf(fichier_pdf, width = 22, height = 14)
+  for (i in 1:n_pages_x) {
+    ids_page <- traj_summary_x$traj_id[((i-1)*n_par_page+1) : min(i*n_par_page, nrow(traj_summary_x))]
+
+    p <- ggplot(traj_long_x %>% dplyr::filter(traj_id %in% ids_page),
+                aes(x = noeud, y = traj_id, fill = etat)) +
+      geom_tile(color = "black", linewidth = 0.5) +
+      geom_text(aes(label = etat), size = 2, color = "black", fontface = "bold") +
+      geom_text(data = traj_summary_plot_x %>% dplyr::filter(traj_id %in% ids_page),
+                aes(x = n_noeuds_x + 0.5, y = traj_id,
+                    label = paste0("n=", n, "  (", prop, "%)")),
+                inherit.aes = FALSE, size = 2.5, hjust = 0, color = "#333333") +
+      scale_fill_manual(values = couleurs_etats_new) +
+      scale_x_discrete(expand = expansion(add = c(0.5, 3))) +
+      theme_minimal() +
+      theme(axis.text.x  = element_text(size = 7, face = "bold", angle = 30, hjust = 1),
+            axis.text.y  = element_blank(), axis.ticks.y = element_blank(),
+            panel.grid   = element_blank(), legend.position = "bottom",
+            legend.text  = element_text(size = 7),
+            plot.title   = element_text(hjust = 0.5, face = "bold", size = 12),
+            plot.margin  = margin(20, 150, 20, 20)) +
+      labs(title = paste0(titre, " — page ", i, "/", n_pages_x),
+           x = "Noeud temporel", y = NULL, fill = "État")
+    print(p)
+  }
+  dev.off()
+  cat("PDF exporté :", fichier_pdf, "\n")
+}
+
+# Export des deux tableaux
+produire_tableau_trajectoires(
+  events_large_0plus, noeuds_0plus,
+  "Trajectoires de vie — Saumons 0+",
+  "tableau_trajectoires_0plus.pdf"
+)
+
+produire_tableau_trajectoires(
+  events_large_1plus, noeuds_1plus,
+  "Trajectoires de vie — Saumons 1+",
+  "tableau_trajectoires_1plus.pdf"
+)
+```
+```{r}
+# Vérification finale
+cat("Individus 0+ :", nrow(events_large_0plus), "\n")
+cat("Individus 1+ :", nrow(events_large_1plus), "\n")
+cat("Total        :", nrow(events_large_0plus) + nrow(events_large_1plus), "\n")
+cat("Tagués Roche :", length(pits_roche), "\n")
+cat("Différence (3 individus printemps uniquement) :",
+    length(pits_roche) - nrow(events_large_0plus) - nrow(events_large_1plus), "\n")
+```
+
+```{r}
+# Vérification : Aut0 (0+) + Aut1 (1+) = tous les individus tagués à La Roche
+
+n_0plus <- nrow(events_large_0plus)
+n_1plus <- nrow(events_large_1plus)
+total   <- n_0plus + n_1plus
+
+cat("Individus 0+ (Aut0) :", n_0plus, "\n")
+cat("Individus 1+ (Aut1) :", n_1plus, "\n")
+cat("Total                :", total, "\n")
+cat("Individus tagués Roche :", length(pits_roche), "\n")
+cat("Différence           :", length(pits_roche) - total, "\n")
+```
+```{r}
+# Tous les pits de pits_roche sont-ils dans events_large ?
+pits_manquants <- setdiff(pits_roche, events_large$pits)
+cat("Individus dans pits_roche mais absents de events_large :", length(pits_manquants), "\n")
+
+# Pourquoi sont-ils absents ? Regarder leur état en Aut0 dans events
+events %>%
+  filter(pits %in% pits_manquants, noeud == "Aut0") %>%
+  dplyr::count(etat, source_detection, lieu)
+
+# Tous les pits de pits_roche sont-ils dans events_large ?
+pits_manquants <- setdiff(pits_roche, events_large$pits)
+cat("Individus dans pits_roche mais absents de events_large :", length(pits_manquants), "\n")
+
+# Pourquoi sont-ils absents ? Regarder leur état en Aut0 dans events
+events %>%
+  filter(pits %in% pits_manquants, noeud == "Aut0") %>%
+  dplyr::count(etat, source_detection, lieu)
+
+# Sont-ils dans Roche avant fusion ?
+Roche %>% filter(pits %in% pits_manquants) %>%
+  select(pits, date, lieu, source_detection)
+
+df_TRI %>%
+  filter(trimws(gsub("TAG_", "", as.character(pits))) %in% pits_manquants) %>%
+  select(pits, cam_date_heure_fin)
+
+# Format des pits dans Roche après nettoyage
+Roche %>% filter(pits %in% pits_manquants) %>% select(pits)
+
+# Format des pits manquants eux-mêmes
+pits_manquants
+
+# Est-ce que ces pits sont bien dans Roche après harmonisation ?
+Roche %>% filter(pits %in% pits_manquants)
+
+# Et dans events ?
+events %>% filter(pits %in% pits_manquants)
+
+# Est-ce que ces pits sont bien dans Roche après harmonisation ?
+Roche %>% filter(pits %in% pits_manquants)
+
+# Et dans events ?
+events %>% filter(pits %in% pits_manquants)
+
+# Leurs observations dans events avec toutes les infos
+events %>%
+  filter(pits %in% pits_manquants) %>%
+  select(pits, date, mois, saison, annee_t0, annee_relative, noeud, etat, source_detection) %>%
+  arrange(pits, date)
+```
+individus capturés une première fois à Pri0 puis ensuite pas attrapés à Aut0 mais à Aut1
+
+# ============================================================
+#XII. SAUVEGARDE DES OBJETS R
+
+```{r sauvegarde}
+# Sauvegarder tous les objets importants pour reprendre demain sans tout re-runner
+saveRDS(events,              "events.rds")
+saveRDS(events_noeud,        "events_noeud.rds")
+saveRDS(events_large,        "events_large.rds")
+saveRDS(events_noeud_new,    "events_noeud_new.rds")
+saveRDS(events_large_0plus,  "events_large_0plus.rds")
+saveRDS(events_large_1plus,  "events_large_1plus.rds")
+
+saveRDS(liens,               "liens.rds")
+saveRDS(noeuds_uniques,      "noeuds_uniques.rds")
+saveRDS(t0,                  "t0.rds")
+saveRDS(Roche,               "Roche.rds")
+saveRDS(Oir,                 "Oir.rds")
+saveRDS(antennes,            "antennes.rds")
+```
+
+#XIII. RECHARGEMENT (à utiliser en début de session suivante)
+# ============================================================
+
+```{r rechargement, eval=FALSE}
+# Ce chunk n'est pas exécuté automatiquement (eval=FALSE)
+# Le lancer manuellement quand on reprend le travail
+events             <- readRDS("events.rds")
+events_noeud       <- readRDS("events_noeud.rds")
+events_large       <- readRDS("events_large.rds")
+events_noeud_new   <- readRDS("events_noeud_new.rds")
+events_large_0plus <- readRDS("events_large_0plus.rds")
+events_large_1plus <- readRDS("events_large_1plus.rds")
+
+liens              <- readRDS("liens.rds")
+noeuds_uniques     <- readRDS("noeuds_uniques.rds")
+t0                 <- readRDS("t0.rds")
+Roche              <- readRDS("Roche.rds")
+Oir                <- readRDS("Oir.rds")
+antennes           <- readRDS("antennes.rds")
+```
+
+
+#XIV. Probabilités de Transitions
+```{r}
+# ============================================================
+# PROBABILITÉS DE TRANSITION ORDRE 2 — NOEUDS PHYSIQUES UNIQUEMENT
+# P(état_t+1 | état_t, état_t-1)
+# ============================================================
+
+# --- Noeuds physiques uniquement (sans transitions antennes) ---
+noeuds_physiques_0plus <- c("Aut0", "Pri1", "Aut1", "Pri2", "Aut2", "Pri3", "Aut3")
+noeuds_physiques_1plus <- c("Aut1", "Pri2", "Aut2", "Pri3", "Aut3")
+
+# --- Fonction générique ---
+calculer_transitions_ordre2 <- function(events_large_x, noeuds_x) {
+  
+  events_large_x %>%
+    dplyr::select(pits, dplyr::any_of(noeuds_x)) %>%
+    tidyr::pivot_longer(cols = -pits, names_to = "noeud", values_to = "etat") %>%
+    dplyr::mutate(noeud = factor(noeud, levels = noeuds_x)) %>%
+    dplyr::group_by(pits) %>%
+    dplyr::mutate(
+      etat_precedent = dplyr::lag(etat),
+      etat_suivant   = dplyr::lead(etat)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::filter(!is.na(etat_precedent), !is.na(etat_suivant)) %>%
+    dplyr::count(noeud, etat_precedent, etat, etat_suivant) %>%
+    dplyr::group_by(noeud, etat_precedent, etat) %>%
+    dplyr::mutate(
+      total = sum(n),
+      proba = round(n / total, 3)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::arrange(noeud, etat_precedent, etat, desc(proba))
+}
+
+# --- Calcul pour 0+ et 1+ ---
+proba_ordre2_0plus <- calculer_transitions_ordre2(events_large_0plus, noeuds_physiques_0plus)
+proba_ordre2_1plus <- calculer_transitions_ordre2(events_large_1plus, noeuds_physiques_1plus)
+
+# --- Vérification ---
+# Exemple : à Pri1, quelle proba d'état selon l'état en Aut0 ?
+proba_ordre2_0plus %>%
+  filter(noeud == "Pri1") %>%
+  print(n = 50)
+
+# Exemple : à Aut1, quelle proba d'état selon l'état en Pri1 ET Aut0 ?
+proba_ordre2_0plus %>%
+  filter(noeud == "Aut1") %>%
+  print(n = 50)
+```
+```{r}
+# Chaque groupe (noeud x etat_precedent x etat) doit sommer à 1
+proba_ordre2_0plus %>%
+  group_by(noeud, etat_precedent, etat) %>%
+  summarise(somme_probas = sum(proba), .groups = "drop") %>%
+  filter(abs(somme_probas - 1) > 0.01)  # affiche les groupes qui ne somment pas à 1
+```
+
+
+```{r}
+# Filtrer un noeud pour commencer — exemple Pri1
+proba_ordre2_0plus %>%
+  filter(noeud == "Pri1") %>%
+  # Créer un label combiné pour l'axe y
+  mutate(contexte = paste0(etat_precedent, " → ", etat)) %>%
+  ggplot(aes(x = etat_suivant, y = contexte, fill = proba)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(proba, 2)), size = 2.5) +
+  scale_fill_gradient(low = "#fffde7", high = "#b71c1c", name = "Probabilité") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+    axis.text.y = element_text(size = 7),
+    plot.title  = element_text(hjust = 0.5, face = "bold")
+  ) +
+  labs(
+    title = "P(état Aut1 | état Pri1, état Aut0) — Individus 0+",
+    x = "État suivant (Aut1)",
+    y = "Contexte (Aut0 → Pri1)"
+  )
+
+ggsave("heatmap_ordre2_Pri1.png", width = 14, height = 10, dpi = 300)
+```
+```{r}
+# ============================================================
+# ORDRE 1 (sans passé) — 0+
+# ============================================================
+proba_ordre1_0plus <- calculer_transitions_ordre1(
+  events_large_0plus, 
+  noeuds_physiques_0plus
+)
+
+# Vérification exemple Pri1
+proba_ordre1_0plus %>%
+  filter(noeud == "Pri1") %>%
+  print(n = 50)
+
+# Vérification exemple Aut1
+proba_ordre1_0plus %>%
+  filter(noeud == "Aut1") %>%
+  print(n = 50)
+
+# ============================================================
+# ORDRE 1 (sans passé) — 1+
+# ============================================================
+proba_ordre1_1plus <- calculer_transitions_ordre1(
+  events_large_1plus,
+  noeuds_physiques_1plus
+)
+
+# Vérification exemple Pri2 (= leur premier printemps)
+proba_ordre1_1plus %>%
+  filter(noeud == "Pri2") %>%
+  print(n = 50)
+
+# ============================================================
+# ORDRE 2 (avec passé) — 1+
+# ============================================================
+proba_ordre2_1plus <- calculer_transitions_ordre2(
+  events_large_1plus,
+  noeuds_physiques_1plus
+)
+
+# Vérification exemple Pri2
+proba_ordre2_1plus %>%
+  filter(noeud == "Pri2") %>%
+  print(n = 50)
+```
+
+
+```{r}
+# ============================================================
+# EXPORT PDF — Heatmaps ordre 1 et ordre 2
+# ============================================================
+
+# --- PDF 0+ ordre 1 (sans passé) ---
+pdf("heatmaps_ordre1_0plus.pdf", width = 16, height = 10)
+for (n in noeuds_physiques_0plus[-1]) {  # on skip Aut0 (pas de noeud précédent)
+  p <- plot_ordre1(proba_ordre1_0plus, n,
+                   paste0("P(", n, " | noeud précédent) — 0+ — Sans passé"))
+  print(p)
+}
+dev.off()
+
+# --- PDF 0+ ordre 2 (avec passé) ---
+pdf("heatmaps_ordre2_0plus.pdf", width = 16, height = 10)
+for (n in noeuds_physiques_0plus[-c(1,2)]) {  # skip Aut0 et Pri1 (pas assez de passé)
+  p <- plot_ordre2(proba_ordre2_0plus, n,
+                   paste0("P(", n, " | 2 noeuds précédents) — 0+ — Avec passé"))
+  print(p)
+}
+dev.off()
+
+# --- PDF 1+ ordre 1 (sans passé) ---
+pdf("heatmaps_ordre1_1plus.pdf", width = 16, height = 10)
+for (n in noeuds_physiques_1plus[-1]) {  # skip Aut1
+  p <- plot_ordre1(proba_ordre1_1plus, n,
+                   paste0("P(", n, " | noeud précédent) — 1+ — Sans passé"))
+  print(p)
+}
+dev.off()
+
+# --- PDF 1+ ordre 2 (avec passé) ---
+pdf("heatmaps_ordre2_1plus.pdf", width = 16, height = 10)
+for (n in noeuds_physiques_1plus[-c(1,2)]) {  # skip Aut1 et Pri2
+  p <- plot_ordre2(proba_ordre2_1plus, n,
+                   paste0("P(", n, " | 2 noeuds précédents) — 1+ — Avec passé"))
+  print(p)
+}
+dev.off()
+
+cat("4 PDF exportés !\n")
+```
+```{r}
+# ============================================================
+# TEST CHI² : le passé influence-t-il les transitions ?
+# H0 : P(état_t+1 | état_t) = P(état_t+1 | état_t, état_t-1)
+# ============================================================
+
+# Fonction générique pour tester un noeud donné
+tester_markov <- function(proba_ordre1_x, proba_ordre2_x, noeud_cible) {
+  
+  # Récupérer les transitions ordre 2 au noeud cible
+  obs_ordre2 <- proba_ordre2_x %>%
+    filter(noeud == noeud_cible) %>%
+    select(etat_precedent, etat, etat_suivant, n)
+  
+  if (nrow(obs_ordre2) == 0) {
+    cat("Pas assez de données pour", noeud_cible, "\n")
+    return(NULL)
+  }
+  
+  # Pour chaque combinaison (etat_precedent, etat) → table de contingence
+  # et tester si la distribution de etat_suivant dépend de etat_precedent
+  
+  # Table de contingence : etat_precedent x etat_suivant, pour chaque etat
+  resultats <- obs_ordre2 %>%
+    group_by(etat) %>%
+    group_map(function(df_etat, key) {
+      
+      # Table de contingence etat_precedent x etat_suivant
+      tab <- df_etat %>%
+        select(etat_precedent, etat_suivant, n) %>%
+        tidyr::pivot_wider(names_from = etat_suivant, 
+                           values_from = n, 
+                           values_fill = 0) %>%
+        column_to_rownames("etat_precedent") %>%
+        as.matrix()
+      
+      # Chi² seulement si au moins 2 lignes et 2 colonnes
+      if (nrow(tab) < 2 | ncol(tab) < 2) {
+        return(tibble(
+          etat       = key$etat,
+          chi2       = NA,
+          df         = NA,
+          p_value    = NA,
+          conclusion = "Pas assez de groupes"
+        ))
+      }
+      
+      # Test Chi² (ou Fisher si effectifs faibles)
+      n_min <- min(tab)
+      if (n_min < 5) {
+        test <- fisher.test(tab, simulate.p.value = TRUE, B = 10000)
+        return(tibble(
+          etat       = key$etat,
+          chi2       = NA,
+          df         = NA,
+          p_value    = round(test$p.value, 4),
+          conclusion = ifelse(test$p.value < 0.05,
+                              "Le passé compte (p < 0.05)",
+                              "Le passé ne compte pas (p >= 0.05)")
+        ))
+      } else {
+        test <- chisq.test(tab)
+        return(tibble(
+          etat       = key$etat,
+          chi2       = round(test$statistic, 3),
+          df         = test$parameter,
+          p_value    = round(test$p.value, 4),
+          conclusion = ifelse(test$p.value < 0.05,
+                              "Le passé compte (p < 0.05)",
+                              "Le passé ne compte pas (p >= 0.05)")
+        ))
+      }
+    }) %>%
+    bind_rows() %>%
+    mutate(noeud = noeud_cible)
+  
+  return(resultats)
+}
+
+# --- Appliquer sur tous les noeuds automne (sauf Aut0) pour les 0+ ---
+noeuds_a_tester_0plus <- c("Aut1", "Aut2", "Aut3")
+
+resultats_markov_0plus <- purrr::map_dfr(
+  noeuds_a_tester_0plus,
+  ~tester_markov(proba_ordre1_0plus, proba_ordre2_0plus, .x)
+)
+
+cat("=== Test de Markov — 0+ ===\n")
+print(resultats_markov_0plus)
+
+# --- Appliquer pour les 1+ ---
+noeuds_a_tester_1plus <- c("Aut2", "Aut3")
+
+resultats_markov_1plus <- purrr::map_dfr(
+  noeuds_a_tester_1plus,
+  ~tester_markov(proba_ordre1_1plus, proba_ordre2_1plus, .x)
+)
+
+cat("\n=== Test de Markov — 1+ ===\n")
+print(resultats_markov_1plus)
+```
+
+
+
+
+#XV. Biais de sélection : PIT tagués vs non PIT tagués
+Le protocole de marquage introduit-il un biais de sélection morphologique ? Les individus marqués sont-ils représentatifs de l'ensemble de la population ?
+```{r}
+# Question biologique : Le protocole de marquage introduit-il
+# un biais de sélection morphologique ? Les individus marqués
+# sont-ils représentatifs de l'ensemble de la population ?
+# ============================================================
+
+# --- Création des deux groupes ---
+df_pit    <- df_TRI %>% filter(!is.na(pits), pits != "NA")
+df_nopit  <- df_TRI %>% filter(is.na(pits) | pits == "NA")
+
+cat("PIT tags :", nrow(df_pit), "\n")
+cat("No PIT tags :", nrow(df_nopit), "\n")
+
+# --- Résumé morphologique comparé ---
+bind_rows(
+  df_pit   %>% mutate(groupe = "PIT tags"),
+  df_nopit %>% mutate(groupe = "No PIT tags")
+) %>%
+  group_by(groupe) %>%
+  summarise(
+    n              = n(),
+    taille_moy     = round(mean(cap_lf, na.rm = TRUE), 1),
+    taille_sd      = round(sd(cap_lf, na.rm = TRUE), 1),
+    taille_med     = round(median(cap_lf, na.rm = TRUE), 1),
+    poids_moy      = round(mean(cap_poids, na.rm = TRUE), 1),
+    poids_sd       = round(sd(cap_poids, na.rm = TRUE), 1),
+    condition_moy  = round(mean(residus_condition, na.rm = TRUE), 3),
+    prop_matures   = round(mean(mature_final == TRUE, na.rm = TRUE) * 100, 1),
+    prop_0plus     = round(mean(age_groupe_final == "0", na.rm = TRUE) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  print()
+
+# --- Tests statistiques ---
+cat("\n=== Test Wilcoxon — taille ===\n")
+wilcox.test(df_pit$cap_lf, df_nopit$cap_lf)
+
+cat("\n=== Test Wilcoxon — poids ===\n")
+wilcox.test(df_pit$cap_poids, df_nopit$cap_poids)
+
+cat("\n=== Test Wilcoxon — condition K ===\n")
+wilcox.test(df_pit$residus_condition, df_nopit$K)
+
+cat("\n=== Test proportion matures ===\n")
+prop.test(
+  x = c(sum(df_pit$mature_final   == TRUE, na.rm = TRUE),
+        sum(df_nopit$mature_final == TRUE, na.rm = TRUE)),
+  n = c(sum(!is.na(df_pit$mature_final)),
+        sum(!is.na(df_nopit$mature_final)))
+)
+
+cat("\n=== Test proportion 0+ ===\n")
+prop.test(
+  x = c(sum(df_pit$age_groupe_final   == "0", na.rm = TRUE),
+        sum(df_nopit$age_groupe_final == "0", na.rm = TRUE)),
+  n = c(sum(!is.na(df_pit$age_groupe_final)),
+        sum(!is.na(df_nopit$age_groupe_final)))
+)
+
+# --- Visualisations ---
+data_comp <- bind_rows(
+  df_pit   %>% mutate(groupe = "PIT tags"),
+  df_nopit %>% mutate(groupe = "No PIT tags")
+)
+
+# Taille
+p1 <- ggplot(data_comp, aes(x = groupe, y = cap_lf, fill = groupe)) +
+  geom_violin(alpha = 0.6, trim = FALSE) +
+  geom_boxplot(width = 0.1, outlier.shape = NA, alpha = 0.8) +
+  scale_fill_manual(values = c("PIT tags" = "steelblue",
+                                "No PIT tags" = "grey60")) +
+  theme_classic() +
+  labs(x = NULL, y = "Fork length (mm)", title = "Size") +
+  theme(legend.position = "none")
+
+# Poids
+p2 <- ggplot(data_comp, aes(x = groupe, y = cap_poids, fill = groupe)) +
+  geom_violin(alpha = 0.6, trim = FALSE) +
+  geom_boxplot(width = 0.1, outlier.shape = NA, alpha = 0.8) +
+  scale_fill_manual(values = c("PIT tags" = "steelblue",
+                                "No PIT tags" = "grey60")) +
+  theme_classic() +
+  labs(x = NULL, y = "Weight (g)", title = "Weight") +
+  theme(legend.position = "none")
+
+# Condition K
+p3 <- ggplot(data_comp, aes(x = groupe, y = residus_condition, fill = groupe)) +
+  geom_violin(alpha = 0.6, trim = FALSE) +
+  geom_boxplot(width = 0.1, outlier.shape = NA, alpha = 0.8) +
+  scale_fill_manual(values = c("PIT tags" = "steelblue",
+                                "No PIT tags" = "grey60")) +
+  theme_classic() +
+  labs(x = NULL, y = "Condition residuals", title = "Physical condition") +
+  theme(legend.position = "none")
+
+# Proportion matures
+p4 <- data_comp %>%
+  filter(!is.na(mature_final)) %>%
+  group_by(groupe, mature_final) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(groupe) %>%
+  mutate(prop = round(n / sum(n) * 100, 1)) %>%
+  ggplot(aes(x = groupe, y = prop, fill = mature_final)) +
+  geom_col() +
+  geom_text(aes(label = paste0(prop, "%")),
+            position = position_stack(vjust = 0.5),
+            size = 3.5, color = "black", fontface = "bold") +
+  scale_fill_manual(values = c("FALSE" = "orange", "TRUE" = "steelblue"),
+                    labels = c("Immature", "Mature")) +
+  theme_classic() +
+  labs(x = NULL, y = "Proportion (%)",
+       fill = "Maturity", title = "Proportion of matures") +
+  theme(legend.position = "bottom")
+
+# Assemblage
+library(patchwork)
+(p1 | p2 | p3) / p4 +
+  plot_annotation(
+    title    = "Sélection biais : PIT tags vs no PIT tags",
+    subtitle = "H0 : no morphologic differences between the groups"
+  )
+
+ggsave("biais_selection_pit.png", width = 14, height = 10, dpi = 300)
+```
+
+#XVI. Analyses GLM — trajectoires et maturité
+##XVI.1 P(smolt) ~ Maturite à t-1
+Dévalé (smolt = 1) :
+Aut0 = Roche_Mat_0 ou Roche_Imm_0
+Trans_Aut0_Pri1 = Antennes_Roche ou Antennes_Moulin
+Pri1 = Non_vu
+Résident (smolt = 0) :
+Aut0 = Roche_Mat_0 ou Roche_Imm_0
+et (Pri1 = Roche_Mat ou Roche_Imm) quelque soit Trans_Aut0_Pri1
+
+```{r}
+library(dplyr)
+library(stringr)
+
+data_0plus_glm <- events_large_0plus %>%
+  # --- Poissons initialement à Roche
+  filter(str_detect(Aut0, regex("Roche_Mat_0|Roche_Imm_0", ignore_case = TRUE))) %>%
+  mutate(
+    # --- maturité à Aut0
+    mature = if_else(str_detect(Aut0, regex("Mat", ignore_case = TRUE)), 1, 0),
+    
+    # --- smolt : 1 = dévalé, 0 = résident
+    smolt = case_when(
+      # Dévalé : Trans = Antennes puis Pri1 = Non_vu (partiel OK)
+      str_detect(Trans_Aut0_Pri1, regex("Antennes_Roche|Antennes_Moulin", ignore_case = TRUE)) &
+      str_detect(Pri1, regex("Non", ignore_case = TRUE)) ~ 1,
+      
+      # Résident : Pri1 = Roche_Mat ou Roche_Imm
+      str_detect(Pri1, regex("Roche_Mat|Roche_Imm", ignore_case = TRUE)) ~ 0,
+      
+      TRUE ~ NA_real_
+    )
+  )
+```
+
+```{r}
+table(data_0plus_glm$mature, data_0plus_glm$smolt, useNA = "ifany")
+```
+
+(Intercept) = log-odds global de smoltifier pour tous les poissons (sans tenir compte de mature).
+Probabilité = exp(Intercept)/(1+exp(Intercept)) → proportion globale de smolt.
+```{r}
+glm_smolt <- glm(smolt ~ mature, data = data_0plus_glm, family = binomial)
+summary(glm_smolt)
+```
+coef(glm_smolt) : effet de la maturité à Aut0 sur la probabilité de dévaler.
+Tout est numérique et rigoureux (0/1), pas de NA dans la colonne mature initiale.
+
+Model intercept seulement :
+```{r}
+# Modèle nul : P(smolt) ~ 1
+glm_null <- glm(smolt ~ 1, data = data_0plus_glm, family = binomial)
+
+summary(glm_null)
+```
+
+```{r}
+# Comparer les deux modèles
+AIC(glm_null, glm_smolt)
+anova(glm_null, glm_smolt, test = "Chisq")
+```
+
+```{r}
+library(dplyr)
+library(stringr)
+
+data_0plus_smolt <- events_large_0plus %>%
+  filter(str_detect(Aut0, "Roche_Imm_0|Roche_Mat_0")) %>%
+  mutate(
+    # --- maturité à Aut0
+    mature = case_when(
+      str_detect(Aut0, "Roche_Mat") ~ 1,
+      str_detect(Aut0, "Roche_Imm") ~ 0
+    ),
+
+    # --- passage en transition (dévalaison potentielle)
+    deval = str_detect(Trans_Aut0_Pri1, "Antennes_Roche|Antennes_Moulin"),
+
+    # --- revu à Roche (Pri1 ou Aut1)
+    revu_roche = str_detect(Pri1, "Roche_Imm|Roche_Mat") |
+                 str_detect(Aut1, "Roche_Imm|Roche_Mat"),
+
+    # --- statut smolt
+    smolt = case_when(
+      deval & !revu_roche ~ 1,  # dévalé et jamais revu → smolt
+      revu_roche          ~ 0,  # revu → résident
+      TRUE                ~ NA_real_
+    )
+  ) %>%
+  filter(!is.na(smolt), !is.na(mature))
+```
+
+```{r}
+table(data_0plus_smolt$mature, data_0plus_smolt$smolt)
+prop.table(table(data_0plus_smolt$mature, data_0plus_smolt$smolt), margin = 1)
+```
+
+```{r}
+glm_smolt <- glm(smolt ~ mature, data = data_0plus_smolt, family = binomial)
+summary(glm_smolt)
+```
+
+
+
+##XVI.2 P(revu) ~ Maturité à t-1
+Arbre avec transition (seuls 0+)
+
+```{r}
+library(dplyr)
+library(stringr)
+
+data_0plus_revu <- events_large_0plus %>%
+  # Filtrer Aut0 connu
+  filter(str_detect(Aut0, "Roche_Imm_0|Roche_Mat_0")) %>%
+  mutate(
+    # Maturité à Aut0
+    mature = case_when(
+      str_detect(Aut0, "Roche_Mat") ~ 1,
+      str_detect(Aut0, "Roche_Imm") ~ 0,
+      TRUE ~ NA_real_
+    ),
+    # Revu à Aut1
+    revu = case_when(
+      Aut1 != "Non_vu" ~ 1,
+      Aut1 == "Non_vu" ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(!is.na(mature), !is.na(revu))
+
+# Vérifier effectifs
+table(data_0plus_revu$mature, data_0plus_revu$revu)
+prop.table(table(data_0plus_revu$mature, data_0plus_revu$revu), margin = 1)
+
+# GLM
+glm_0plus_revu <- glm(revu ~ mature, data = data_0plus_revu, family = binomial)
+summary(glm_0plus_revu)
+```
+IC : 
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# Créer un tableau de prédiction pour mature = 0 et 1
+pred_revu <- data.frame(mature = c(0, 1))
+
+# Prédiction sur l'échelle logit (link) avec erreur standard
+predictions <- predict(glm_0plus_revu, newdata = pred_revu, type = "link", se.fit = TRUE)
+
+# IC 95% sur logit
+crit <- 1.96
+pred_revu <- pred_revu %>%
+  mutate(
+    logit_fit = predictions$fit,
+    logit_lwr = predictions$fit - crit * predictions$se.fit,
+    logit_upr = predictions$fit + crit * predictions$se.fit,
+    prob_revu = plogis(logit_fit),
+    prob_lwr = plogis(logit_lwr),
+    prob_upr = plogis(logit_upr),
+    interpretation = c(
+      paste0("Immature → P(revu) ≈ ", round(prob_revu[1], 2)),
+      paste0("Mature → P(revu) ≈ ", round(prob_revu[2], 2))
+    )
+  )
+
+pred_revu
+```
+```{r}
+Prevu <-ggplot(pred_revu, aes(x = factor(mature, labels = c("Immature", "Mature")), y = prob_revu)) +
+  geom_col(fill = "steelblue") +
+  geom_errorbar(aes(ymin = prob_lwr, ymax = prob_upr), width = 0.2) +
+  geom_text(aes(label = round(prob_revu, 2)), 
+            y = pred_revu$prob_upr + 0.05,  # décalage pour ne pas chevaucher IC
+            size = 5) +
+  ylim(0, 1) +
+  labs(
+    x = "Maturity at Aut0",
+    y = "Probability to be seen at Aut1",
+    title = "The effect of maturity at Aut0 on the probability of being seen again"
+  ) +
+  theme_minimal(base_size = 14)
+print(Prevu)
+ggsave("Prevu.png", plot = Prevu,width = 10, height = 6, dpi = 300)
+```
+Juste printemps : 
+```{r}
+library(dplyr)
+library(stringr)
+
+data_0plus_revu_print <- events_large_0plus %>%
+  # Filtrer Aut0 connu
+  filter(str_detect(Aut0, "Roche_Imm_0|Roche_Mat_0")) %>%
+  mutate(
+    # Maturité à Aut0
+    mature = case_when(
+      str_detect(Aut0, "Roche_Mat") ~ 1,
+      str_detect(Aut0, "Roche_Imm") ~ 0,
+      TRUE ~ NA_real_
+    ),
+    # Revu à Aut1
+    revu = case_when(
+      Pri1 != "Non_vu" ~ 1,
+      Pri1 == "Non_vu" ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(!is.na(mature), !is.na(revu))
+
+# Vérifier effectifs
+table(data_0plus_revu_print$mature, data_0plus_revu_print$revu)
+prop.table(table(data_0plus_revu_print$mature, data_0plus_revu_print$revu), margin = 1)
+
+# GLM
+glm_0plus_revu_print <- glm(revu ~ mature, data = data_0plus_revu_print, family = binomial)
+summary(glm_0plus_revu_print)
+```
+
+##XVI.3 P(mature t+1) ~ Mature t 
+Parmi les individus REVUS à Aut1, la maturité à Aut0 prédit elle la proba d'être à nouveau mature à Aut1 ?
+Hypothèse : Un individu mature à Aut0 a une probabilité plus léevée d'être mature à Aut1 - suggérant une répétabilité de la tactique parasite. 
+!! PARMI LES IMMATURES IL PEUT YA AVOIR DES FEMELLES !!
+
+Définir les variables :
+- Filtrer les 0+ avec Aut0 connu (Roche_Imm_0 / Roche_Mat_0 ou _1)
+- Filtrer uniquement ceux qui ont été revus à Aut1 (Aut1 != "Non_vu")
+- Maturité à Aut0 → mature_t : 0 = Immature, 1 = Mature
+- Maturité à Aut1 → mature_t1 : 0 = Immature, 1 = Mature
+```{r}
+library(dplyr)
+library(stringr)
+
+data_mature_t1 <- events_large_0plus %>%
+  # --- Garder Aut0 connu ---
+  filter(str_detect(Aut0, "Roche_Imm_0|Roche_Mat_0")) %>%
+  # --- Revu à Aut1 uniquement ---
+  filter(Aut1 != "Non_vu") %>%
+  mutate(
+    # Maturité à Aut0
+    mature_t = case_when(
+      str_detect(Aut0, "Roche_Mat") ~ 1,
+      str_detect(Aut0, "Roche_Imm") ~ 0
+    ),
+    # Maturité à Aut1
+    mature_t1 = case_when(
+      str_detect(Aut1, "Roche_Mat") ~ 1,
+      str_detect(Aut1, "Roche_Imm") ~ 0
+    )
+  ) %>%
+  filter(!is.na(mature_t), !is.na(mature_t1))
+```
+
+
+```{r}
+# Vérification
+table(data_mature_t1$mature_t, data_mature_t1$mature_t1)
+prop.table(table(data_mature_t1$mature_t, data_mature_t1$mature_t1), margin = 1)
+```
+
+
+```{r}
+# GLM
+glm_mature_t1 <- glm(mature_t1 ~ mature_t, data = data_mature_t1, family = binomial)
+summary(glm_mature_t1)
+```
+
+```{r}
+# Probabilités prédites pour Immature et Mature à Aut0
+pred <- data.frame(mature_t = c(0, 1))
+pred$prob_mature_t1 <- predict(glm_mature_t1, newdata = pred, type = "response")
+
+# Ajouter phrases interprétatives
+pred$interpretation <- c(
+  paste0("Immature à Aut0 → P(mature à Aut1) ≈ ", round(pred$prob_mature_t1[1], 2),
+         " (environ la moitié des immatures deviennent matures)"),
+  paste0("Mature à Aut0 → P(mature à Aut1) ≈ ", round(pred$prob_mature_t1[2], 2),
+         " (la plupart des matures restent matures)")
+)
+
+pred
+```
+
+```{r}
+# Modèle nul (sans maturité)
+glm_null <- glm(mature_t1 ~ 1, data = data_mature_t1, family = binomial)
+
+# AIC
+AIC(glm_mature_t1)   # modèle avec mature_t
+AIC(glm_null)         # modèle nul
+```
+
+IC : 
+```{r}
+# Préparation
+pred <- data.frame(mature_t = c(0, 1))
+
+# Prédiction sur l'échelle logit avec erreur standard
+predictions <- predict(glm_mature_t1, newdata = pred, type = "link", se.fit = TRUE)
+
+# Calcul des intervalles de confiance à 95% sur l'échelle logit
+crit <- 1.96
+pred$logit_fit <- predictions$fit
+pred$logit_lwr <- predictions$fit - crit * predictions$se.fit
+pred$logit_upr <- predictions$fit + crit * predictions$se.fit
+
+# Transformation en probabilités
+pred <- pred %>%
+  mutate(
+    prob_mature_t1 = plogis(logit_fit),
+    prob_lwr = plogis(logit_lwr),
+    prob_upr = plogis(logit_upr)
+  )
+
+pred
+```
+
+```{r}
+library(ggplot2)
+
+Pmat1 <- ggplot(pred, aes(x = factor(mature_t, labels = c("Immature", "Mature")), y = prob_mature_t1)) +
+  geom_col(fill = "steelblue") +
+  geom_errorbar(aes(ymin = prob_lwr, ymax = prob_upr), width = 0.2) +
+  geom_text(aes(label = round(prob_mature_t1, 2)), 
+            y = pred$prob_upr + 0.03,  # décalage au-dessus de l'IC
+            size = 5) +
+  ylim(0, 1) +
+  labs(
+    x = "Maturity at Aut0",
+    y = "Probability to be mature at Aut1",
+    title = "Probability to be mature at Aut1 depending on maturity at Aut0"
+  ) +
+  theme_minimal(base_size = 14)
+print(Pmat1)
+ggsave("Pmat1.png", plot = Pmat1,width = 10, height = 6, dpi = 300)
+```
+
+

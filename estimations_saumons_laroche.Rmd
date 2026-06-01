@@ -1,0 +1,276 @@
+---
+title: "Estimation des densités de saumons atlantiques — Ruisseau de La Roche"
+author: "Margot Lechêne — M2 Écologie — INRAE DECOD Rennes"
+date: "2026"
+output: html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+# Objectif et contexte
+Ce script estime les densités locales de saumons atlantiques (*Salmo salar*) par secteur, année et classe d'âge sur le ruisseau de La Roche (affluent de l'Oir, Normandie), à partir des données de pêche électrique par épuisement collectées depuis 1988.
+
+La méthode repose sur l'estimateur de **Carle & Strub** appliqué aux pêches multipassage, et sur une **correction par p moyen** pour les pêches unipassage. Les densités produites servent de prédicteur dans l'ensemble des analyses densité-dépendance du projet.
+
+**Données en entrée :**
+- `sat_laroche_multipassage_margot.csv` — comptages par passage pour les pêches multipassage (source : UMR 3E - Clarisse BOULENGER)
+- `sat_laroche_unipassage_margot.csv` — comptages pour les pêches unipassage (source : UMR 3E - Clarisse BOULENGER)
+
+
+**Données en sortie :**
+- `resultats_multipassage.csv` — abondances et probabilités de capture estimées par Carle & Strub
+- `resultats_unipassage.csv` — abondances corrigées par p moyen pour les unipassages
+- `tableau_final_densite.csv` — tableau fusionné multipassage + unipassage, utilisé dans toutes les analyses 
+---
+
+# Packages
+```{r packages, message=FALSE, warning=FALSE}
+library(tidyverse)   # manipulation et visualisation des données
+library(FSA)         # méthode Carle & Strub (fonction removal())
+library(mclust)      # chargé ici car conflit avec dplyr::count() — voir note section 3
+```
+
+# Chemins et chargement des données
+```{r chemins}
+# (A réadapter si besoin)
+chemin_data <- "W:/ESPACEML/02_code_data/Data_Scripts/"
+
+# Lecture des fichiers de comptages
+multi <- read.csv2(paste0(chemin_data, "sat_laroche_multipassage_margot.csv"),
+                   stringsAsFactors = FALSE)
+uni   <- read.csv2(paste0(chemin_data, "sat_laroche_unipassage_margot.csv"),
+                   stringsAsFactors = FALSE)
+```
+
+**Structure attendue des fichiers en entrée :**
+Les deux fichiers doivent contenir au minimum les colonnes suivantes :
+| Colonne | Description |
+|---|---|
+| `sec_code` | Code du secteur de pêche (ex : RR01) |
+| `annee` | Année de la pêche |
+| `mois` | Mois de la pêche |
+| `mtd_num_passage` | Numéro du passage (1, 2, 3...) |
+| `nb_passage` | Nombre total de passages réalisés |
+| `tax_code` | Code espèce (SAT = saumon atlantique) |
+| `age_riv` | Classe d'âge (0+ ou 1+) |
+| `nb` | Nombre d'individus capturés à ce passage |
+| `sec_surface` | Surface du secteur (m²) |
+| `sec_coord_decimal_latitude` | Latitude décimale du secteur |
+| `sec_coord_decimal_longitude` | Longitude décimale du secteur |
+
+```{r preparation}
+# Harmonisation du nom de colonne secteur
+# (le fichier source utilise sec_code, les fonctions aval utilisent sec_cod)
+multi %>% rename(sec_cod = sec_code)
+uni   %>% rename(sec_cod = sec_code)
+
+# Suppression des individus sans classe d'âge déterminée
+multi %>% filter(age_riv != ".")
+uni  %>% filter(age_riv != ".")
+
+cat("Lignes multipassage :", nrow(multi), "\n")
+cat("Lignes unipassage   :", nrow(uni),   "\n")
+cat("Années couvertes    :", range(multi$annee), "\n")
+cat("Secteurs            :", sort(unique(multi$sec_cod)), "\n")
+```
+---
+
+# Fonction d'estimation par Carle & Strub
+La méthode de Carle & Strub (1978) estime l'abondance initiale N0 et la probabilité de capture p à partir des déclins de captures entre passages successifs. Pour chaque combinaison espèce × secteur × classe d'âge × année (appelée "pêche"), un vecteur de captures est constitué (ex : [12, 2] pour deux passages) et soumis à la fonction `removal()` du package `FSA`.
+
+**Note importante** : la fonction `dplyr::count()` doit être appelée explicitement avec le préfixe `dplyr::` pour éviter un conflit avec la fonction `count()` du package `mclust`, qui produit une erreur silencieuse.
+```{r fonction_estimation}
+estimation_densite <- function(multi) {
+  
+  # Exclure les lamproies
+  data_multi <- multi %>%
+    dplyr::filter(!tax_code %in% c("LPP", "LPM", "LPR", "LP", "LAM"))
+  
+  # Coordonnées GPS par secteur
+  coordstation <- unique(data.frame(
+    sec_code        = data_multi$sec_code,
+    decimallatitude = data_multi$sec_coord_decimal_latitude
+  ))
+  
+  # Remplacer les NA par 0
+  data_multi$nb[is.na(data_multi$nb)] <- 0
+  
+  # Clé unique par opération de pêche
+  data_final <- data.frame(
+    data_multi,
+    numero_peche = paste(data_multi$tax_code,
+                         data_multi$sec_code,
+                         data_multi$age_riv,
+                         data_multi$annee,
+                         sep = "_")
+  )
+  
+  # Garder uniquement les pêches avec au moins 2 passages
+  num_peche <- data_final %>%
+    dplyr::count(numero_peche) %>%
+    filter(n > 1)
+  
+  data_final <- data_final %>%
+    filter(numero_peche %in% num_peche$numero_peche)
+  
+  # Vecteur de captures par pêche
+  ds <- split(data_final$nb, data_final$numero_peche)
+  
+  # Carle & Strub
+  res <- sapply(ds, function(x) {
+    confint(removal(catch = as.integer(x)),
+            incl.est = TRUE,
+            parm     = c("No", "p"))
+  })
+  res <- data.frame(t(data.frame(res, check.names = FALSE)))
+  colnames(res) <- c("Abondance", "p",
+                     "Abondance_L_CI", "proba_Capture_L_CI",
+                     "Abondance_U_CI", "Proba_Capture_U_CI")
+  res <- res %>% rownames_to_column(var = "numero_peche")
+  
+  # Joindre les métadonnées
+  t_info      <- unique(select(data_final, -c(mtd_num_passage, nb)))
+  tableau_cal <- merge(res, t_info, by = "numero_peche")
+  tableau_cal <- merge(tableau_cal, coordstation,
+                       by.x = "sec_code", by.y = "sec_code")
+  
+  return(tableau_cal)
+}
+```
+---
+# Estimation multipassage
+```{r multipassage}
+resultats_multi <- estimation_densite(multi)
+
+# Conversion en numérique (les colonnes peuvent être en caractère après import)
+resultats_multi <- resultats_multi %>%
+  mutate(across(c(Abondance, Abondance_L_CI, Abondance_U_CI,
+                  p, proba_Capture_L_CI, Proba_Capture_U_CI,
+                  sec_surface), as.numeric))
+
+# Calcul de la densité (ind/m²) et de ses intervalles de confiance
+resultats_multi <- resultats_multi %>%
+  mutate(
+    Densite_ind_m2 = Abondance      / sec_surface,
+    Densite_L_CI   = Abondance_L_CI / sec_surface,
+    Densite_U_CI   = Abondance_U_CI / sec_surface
+  )
+
+cat("Résultats multipassage :", nrow(resultats_multi), "estimations\n")
+cat("Années couvertes       :", range(resultats_multi$annee), "\n")
+
+```
+---
+# Validation de la probabilité de capture (p)
+
+Avant d'utiliser p pour corriger les unipassages, on vérifie que cette probabilité est homogène entre années et entre secteurs. Une forte hétérogénéité de p fragiliserait la correction des unipassages et donc la fiabilité des densités estimées.
+```{r validation_p}
+# Conversion en numérique de p (peut être en caractère après import)
+resultats_multi <- resultats_multi %>%
+  mutate(p = as.numeric(p))
+
+# Extraire les valeurs de p non manquantes
+p_values <- resultats_multi %>% filter(!is.na(p))
+
+# Coefficient de variation global
+cv_p <- sd(p_values$p) / mean(p_values$p) * 100
+cat("Coefficient de variation de p :", round(cv_p, 1), "%\n")
+
+# Homogénéité de p entre années
+kruskal_annee <- kruskal.test(p ~ as.factor(annee), data = p_values)
+cat("Kruskal-Wallis années   : H =", round(kruskal_annee$statistic, 1),
+    ", p =", round(kruskal_annee$p.value, 3), "\n")
+
+# Homogénéité de p entre secteurs
+kruskal_secteur <- kruskal.test(p ~ as.factor(sec_code), data = p_values)
+cat("Kruskal-Wallis secteurs : H =", round(kruskal_secteur$statistic, 1),
+    ", p =", round(kruskal_secteur$p.value, 3), "\n")
+```
+---
+# Correction des pêches unipassage
+Les pêches unipassage ne permettent pas d'estimer N et p directement. On estime l'abondance réelle en divisant le comptage brut par la probabilité de capture p, estimée depuis les pêches multipassage de la même année et de la même classe d'âge.
+
+**Règle de priorité :**
+1. p moyen pour la même année × même classe d'âge
+2. Si absent : p moyen global pour cette classe d'âge (toutes années confondues)
+
+```{r unipassage}
+# p moyen par année x classe d'âge (référence principale)
+p_moyen <- resultats_multi %>%
+  filter(!is.na(p)) %>%
+  group_by(annee, age_riv) %>%
+  summarise(p_moyen = mean(p), .groups = "drop")
+
+# p moyen global par classe d'âge (valeur de repli si année manquante)
+p_global <- resultats_multi %>%
+  filter(!is.na(p)) %>%
+  group_by(age_riv) %>%
+  summarise(p_global = mean(p), .groups = "drop")
+
+# Joindre les p aux unipassages
+uni <- uni %>%
+  left_join(p_moyen,  by = c("annee", "age_riv")) %>%
+  left_join(p_global, by = "age_riv") %>%
+  mutate(p_moyen = coalesce(p_moyen, p_global)) %>%
+  select(-p_global)
+
+cat("Unipassages sans p :", sum(is.na(uni$p_moyen)), "\n")
+
+# Calcul abondance et densité unipassage
+uni <- uni %>%
+  mutate(across(c(nb, sec_surface), as.numeric))
+
+resultats_uni <- uni %>%
+  mutate(
+    Abondance      = nb / p_moyen,
+    Densite_ind_m2 = Abondance / sec_surface
+  )
+
+cat("Résultats unipassage :", nrow(resultats_uni), "estimations\n")
+```
+---
+# Fusion et export
+```{r fusion_export}
+# Sélection colonnes communes
+multi_bind <- resultats_multi %>%
+  mutate(methode = "multipassage") %>%
+  select(sec_code, annee, mois, age_riv, sec_surface,
+         sec_coord_decimal_latitude, sec_coord_decimal_longitude,
+         Abondance, Densite_ind_m2, methode)
+
+uni_bind <- resultats_uni %>%
+  mutate(methode = "unipassage") %>%
+  select(sec_code, annee, mois, age_riv, sec_surface,
+         sec_coord_decimal_latitude, sec_coord_decimal_longitude,
+         Abondance, Densite_ind_m2, methode)
+
+# Fusion
+tableau_final <- bind_rows(multi_bind, uni_bind)
+
+cat("Tableau final :", nrow(tableau_final), "lignes\n")
+cat("Années        :", range(tableau_final$annee), "\n")
+cat("Secteurs      :", n_distinct(tableau_final$sec_code), "\n")
+
+# Export
+write.csv2(resultats_multi, paste0(chemin_data, "resultats_multipassage.csv"),
+           row.names = FALSE)
+write.csv2(resultats_uni,   paste0(chemin_data, "resultats_unipassage.csv"),
+           row.names = FALSE)
+write.csv2(tableau_final,   paste0(chemin_data, "tableau_final_densite.csv"),
+           row.names = FALSE)
+
+cat("Fichiers exportés dans :", chemin_data, "\n")
+```
+---
+# Résumé des objets produits
+
+| Objet R | Description | Fichier exporté |
+
+| `resultats_multi` | Estimations Carle & Strub (multipassage) | `resultats_multipassage.csv` |
+| `resultats_uni` | Abondances corrigées (unipassage) | `resultats_unipassage.csv` |
+| `tableau_final` | Densités fusionnées — utilisé dans toutes les analyses aval | `tableau_final_densite.csv` |
+
+> **Point d'entrée pour les scripts aval** : le seul objet nécessaire pour la suite est `tableau_final`. 
+```{r import}
+#tableau_final <- read.csv2(paste0(chemin_data, "tableau_final_densite.csv"))
+```
