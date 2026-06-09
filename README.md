@@ -42,3 +42,6 @@ Autumn electrofishing surveys at La Roche (1988–2025)
 PIT tag individual monitoring data (2015–2025)
 Environmental data from the La Roche hydrometric station
 Adult abundance time series on the Oir catchment (Servanty & Prévost, 2016)
+
+If you use these scripts, please cite the associated internship report:
+[Margot LECHÊNE] (2026). Investigating alternative reproductive tactics in wild Atlantic salmon. Master's internship report, Université de Rennes, INRAE DECOD.
