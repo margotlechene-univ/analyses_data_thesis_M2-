@@ -35,3 +35,10 @@ Preliminary Lefkovitch-type matrix model exploring the demographic consequences 
 
 mixtools.R
 Independent validation of age class separation by Gaussian mixture modelling (normalmixEM, k = 2 components, package mixtools). Fitted separately for each year on fork length distributions. Provides accuracy and AUC metrics to assess the robustness of the bimodal age separation.
+
+Data availability
+Raw data are the property of INRAE DECOD + U3E and are not publicly available. Analyses are based on:
+Autumn electrofishing surveys at La Roche (1988–2025)
+PIT tag individual monitoring data (2015–2025)
+Environmental data from the La Roche hydrometric station
+Adult abundance time series on the Oir catchment (Servanty & Prévost, 2016)
